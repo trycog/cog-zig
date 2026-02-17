@@ -3,10 +3,4 @@
     .version = "0.1.0",
     .fingerprint = 0x586349b348314963,
     .paths = .{ "build.zig", "build.zig.zon", "src" },
-    .dependencies = .{
-        .scip_zig = .{
-            .url = "git+https://github.com/bcardarella/scip-zig#9e223ebc6e2244028a0dcb60c6fb1334cdd7318f",
-            .hash = "scip_zig-0.0.0-1nmgk2urAgAayVMlwo2OROIHnpTuZHZGE32sIROZmDix",
-        },
-    },
 }

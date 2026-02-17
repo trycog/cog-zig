@@ -1,0 +1,6 @@
+.{
+    .name = .nested_factory,
+    .version = "0.0.0",
+    .fingerprint = 0x4444444444444444,
+    .paths = .{"src"},
+}

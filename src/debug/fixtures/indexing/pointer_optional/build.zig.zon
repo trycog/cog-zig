@@ -1,0 +1,6 @@
+.{
+    .name = .pointer_optional,
+    .version = "0.0.0",
+    .fingerprint = 0x6666666666666666,
+    .paths = .{"src"},
+}

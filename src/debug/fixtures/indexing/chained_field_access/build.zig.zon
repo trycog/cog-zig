@@ -1,0 +1,6 @@
+.{
+    .name = .chained_field_access,
+    .version = "0.0.0",
+    .fingerprint = 0x3333333333333333,
+    .paths = .{"src"},
+}

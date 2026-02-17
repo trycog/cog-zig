@@ -1,0 +1,6 @@
+.{
+    .name = .comptime_generic,
+    .version = "0.0.0",
+    .fingerprint = 0x7777777777777777,
+    .paths = .{"src"},
+}

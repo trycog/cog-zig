@@ -2,6 +2,22 @@ const std = @import("std");
 const fs = std.fs;
 const mem = std.mem;
 const process = std.process;
+const scip = @import("scip/main.zig");
+
+fn logFn(
+    comptime level: std.log.Level,
+    comptime scope: @Type(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (std.posix.getenv("COG_ZIG_DEBUG") == null) return;
+    std.log.defaultLog(level, scope, format, args);
+}
+
+pub const std_options = std.Options{
+    .log_level = .debug,
+    .logFn = logFn,
+};
 
 pub fn main() !void {
     var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .{};
@@ -13,7 +29,7 @@ pub fn main() !void {
     defer process.argsFree(allocator, args);
 
     if (args.len < 4) {
-        std.debug.print("Usage: scip-zig <project_root> --output <output_path>\n", .{});
+        std.debug.print("Usage: cog-zig <project_root> --output <output_path>\n", .{});
         process.exit(1);
     }
 
@@ -37,7 +53,9 @@ pub fn main() !void {
 
     // Discover package name from build.zig.zon
     const pkg_name = discoverPackageName(allocator, project_root) catch |err| blk: {
-        std.debug.print("Warning: could not read build.zig.zon ({s}), falling back to directory name\n", .{@errorName(err)});
+        if (std.posix.getenv("COG_ZIG_DEBUG") != null) {
+            std.debug.print("debug: could not read build.zig.zon ({s}), using directory name fallback\n", .{@errorName(err)});
+        }
         break :blk dirBasename(project_root);
     };
     defer if (pkg_name.allocated) allocator.free(pkg_name.name);
@@ -49,43 +67,35 @@ pub fn main() !void {
     };
     defer allocator.free(root_source);
 
-    // Locate scip-zig-core next to this executable
-    const core_path = try findCoreBinary(allocator);
-    defer allocator.free(core_path);
-
-    // Create a temp directory for scip-zig-core to write index.scip into
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(tmp_path);
-
-    // Spawn scip-zig-core
-    var child = process.Child.init(
-        &.{ core_path, "--root-path", project_root, "--pkg", pkg_name.name, root_source, "--root-pkg", pkg_name.name },
-        allocator,
-    );
-    child.cwd = tmp_path;
-    child.stderr_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-
-    _ = try child.spawnAndWait();
-
-    // Copy index.scip from temp dir to output path
-    const index_file = tmp_dir.dir.openFile("index.scip", .{}) catch |err| {
-        std.debug.print("Error: scip-zig-core did not produce index.scip: {s}\n", .{@errorName(err)});
-        process.exit(1);
-    };
-    defer index_file.close();
-
     const out_file = try fs.cwd().createFile(output_path.?, .{});
     defer out_file.close();
 
-    var buf: [8192]u8 = undefined;
-    while (true) {
-        const n = try index_file.read(&buf);
-        if (n == 0) break;
-        try out_file.writeAll(buf[0..n]);
-    }
+    var write_buf: [4096]u8 = undefined;
+    var file_writer = out_file.writer(&write_buf);
+
+    const tool_args = [_][]const u8{
+        "cog-zig",
+        "--root-path",
+        project_root,
+        "--pkg",
+        pkg_name.name,
+        root_source,
+        "--root-pkg",
+        pkg_name.name,
+    };
+    const packages = [_]scip.PackageSpec{
+        .{ .name = pkg_name.name, .path = root_source },
+    };
+
+    try scip.run(.{
+        .root_path = project_root,
+        .root_pkg = pkg_name.name,
+        .packages = &packages,
+        .tool_name = "cog-zig",
+        .tool_arguments = &tool_args,
+    }, allocator, &file_writer.interface);
+
+    try file_writer.interface.flush();
 }
 
 const PackageName = struct {
@@ -93,7 +103,7 @@ const PackageName = struct {
     allocated: bool,
 };
 
-fn discoverPackageName(allocator: mem.Allocator, project_root: []const u8) !PackageName {
+pub fn discoverPackageName(allocator: mem.Allocator, project_root: []const u8) !PackageName {
     const zon_path = try fs.path.join(allocator, &.{ project_root, "build.zig.zon" });
     defer allocator.free(zon_path);
 
@@ -102,7 +112,7 @@ fn discoverPackageName(allocator: mem.Allocator, project_root: []const u8) !Pack
 
     // Look for .name = .identifier or .name = "string"
     if (parseDotName(content)) |name| {
-        return .{ .name = name, .allocated = false };
+        return .{ .name = try allocator.dupe(u8, name), .allocated = true };
     }
 
     if (parseStringName(allocator, content)) |name| {
@@ -113,7 +123,7 @@ fn discoverPackageName(allocator: mem.Allocator, project_root: []const u8) !Pack
 }
 
 /// Parse `.name = .identifier` form (Zig 0.14+ style)
-fn parseDotName(content: []const u8) ?[]const u8 {
+pub fn parseDotName(content: []const u8) ?[]const u8 {
     const needle = ".name";
     var pos: usize = 0;
     while (pos < content.len) {
@@ -143,7 +153,7 @@ fn parseDotName(content: []const u8) ?[]const u8 {
 }
 
 /// Parse `.name = "string"` form
-fn parseStringName(allocator: mem.Allocator, content: []const u8) ?[]const u8 {
+pub fn parseStringName(allocator: mem.Allocator, content: []const u8) ?[]const u8 {
     const needle = ".name";
     var pos: usize = 0;
     while (pos < content.len) {
@@ -173,29 +183,62 @@ fn parseStringName(allocator: mem.Allocator, content: []const u8) ?[]const u8 {
     return null;
 }
 
-fn dirBasename(path: []const u8) PackageName {
+pub fn dirBasename(path: []const u8) PackageName {
     const basename = fs.path.basename(path);
     return .{ .name = basename, .allocated = false };
 }
 
-fn discoverRootSource(allocator: mem.Allocator, project_root: []const u8) ?[]const u8 {
+pub fn discoverRootSource(allocator: mem.Allocator, project_root: []const u8) ?[]const u8 {
     const candidates = [_][]const u8{
         "src/main.zig",
         "src/root.zig",
         "src/lib.zig",
         "build.zig",
     };
+    var dir = fs.cwd().openDir(project_root, .{}) catch return null;
+    defer dir.close();
+
     for (candidates) |candidate| {
-        const dir = fs.cwd().openDir(project_root, .{}) catch continue;
         dir.access(candidate, .{}) catch continue;
         return fs.path.join(allocator, &.{ project_root, candidate }) catch continue;
     }
     return null;
 }
 
-fn findCoreBinary(allocator: mem.Allocator) ![]const u8 {
-    const self_path = try fs.selfExePathAlloc(allocator);
-    defer allocator.free(self_path);
-    const dir = fs.path.dirname(self_path) orelse ".";
-    return try fs.path.join(allocator, &.{ dir, "scip-zig" });
+test "parseDotName parses enum-style package name" {
+    const input =
+        \\ .{
+        \\   .name = .cog_zig,
+        \\ }
+    ;
+    const name = parseDotName(input) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("cog_zig", name);
+}
+
+test "parseStringName normalizes hyphenated package names" {
+    const allocator = std.testing.allocator;
+    const input =
+        \\ .{
+        \\   .name = "cog-zig",
+        \\ }
+    ;
+    const name = parseStringName(allocator, input) orelse return error.TestUnexpectedResult;
+    defer allocator.free(name);
+    try std.testing.expectEqualStrings("cog_zig", name);
+}
+
+test "discoverRootSource prefers src/main.zig" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("src");
+    try tmp.dir.writeFile(.{ .sub_path = "src/main.zig", .data = "pub fn main() void {}\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "build.zig", .data = "pub fn build(_: *anyopaque) void {}\n" });
+
+    const abs_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(abs_root);
+
+    const source = discoverRootSource(std.testing.allocator, abs_root) orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(source);
+    try std.testing.expect(std.mem.endsWith(u8, source, "src/main.zig"));
 }

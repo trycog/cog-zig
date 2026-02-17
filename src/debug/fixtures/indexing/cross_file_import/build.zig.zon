@@ -1,0 +1,6 @@
+.{
+    .name = .cross_file_import,
+    .version = "0.0.0",
+    .fingerprint = 0x5555555555555555,
+    .paths = .{"src"},
+}

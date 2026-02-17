@@ -1,0 +1,6 @@
+.{
+    .name = .simple_project,
+    .version = "0.0.0",
+    .fingerprint = 0x1111111111111111,
+    .paths = .{"src"},
+}
