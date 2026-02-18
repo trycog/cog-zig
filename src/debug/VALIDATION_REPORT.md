@@ -17,7 +17,7 @@ zig-out/bin/cog-zig /Users/bcardarella/projects/scip-zig --output /tmp/cog-zig-p
 
 - Build succeeded
 - Tests succeeded
-- Wrapper contract succeeded (`<project_root> --output <path>`)
+- Wrapper contract succeeded (`<file_path> --output <path>`)
 - Output artifact created: `/tmp/cog-zig-plan-validation.scip`
 - Quiet-output check passed:
   - stdout bytes: 0
@@ -70,3 +70,18 @@ Validation:
 - `zig build` passed
 - `zig build test` passed
 - `src/debug/scripts/smoke.sh` passed end-to-end
+
+## Per-file Invocation Alignment Pass
+
+Implemented:
+
+- wrapper now requires file input and rejects non-file paths
+- workspace root is discovered from file parent by walking to nearest `build.zig.zon`
+- scip runner supports single-document filtering for Cog per-file invocation
+- smoke script updated to invoke `cog-zig` once per file
+
+Validation:
+
+- `zig build` passed
+- `zig build test` passed
+- `src/debug/scripts/smoke.sh` passed in per-file mode

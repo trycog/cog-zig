@@ -24,16 +24,16 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
-    // Parse args: <project_root> --output <output_path>
+    // Parse args: <file_path> --output <output_path>
     const args = try process.argsAlloc(allocator);
     defer process.argsFree(allocator, args);
 
     if (args.len < 4) {
-        std.debug.print("Usage: cog-zig <project_root> --output <output_path>\n", .{});
+        std.debug.print("Usage: cog-zig <file_path> --output <output_path>\n", .{});
         process.exit(1);
     }
 
-    const project_root = args[1];
+    const input_path = args[1];
     var output_path: ?[]const u8 = null;
 
     var i: usize = 2;
@@ -51,21 +51,34 @@ pub fn main() !void {
         process.exit(1);
     }
 
+    const input_kind = pathKind(input_path);
+    if (input_kind != .file) {
+        std.debug.print("Error: expected a file path, got non-file input: {s}\n", .{input_path});
+        process.exit(1);
+    }
+
+    const abs_input_file = try fs.cwd().realpathAlloc(allocator, input_path);
+    defer allocator.free(abs_input_file);
+
+    const file_dir = fs.path.dirname(abs_input_file) orelse {
+        std.debug.print("Error: cannot determine parent directory for input file: {s}\n", .{input_path});
+        process.exit(1);
+    };
+
+    const workspace_root = try findWorkspaceRoot(allocator, file_dir);
+    defer allocator.free(workspace_root);
+
+    const file_relative_path = try fs.path.relative(allocator, workspace_root, abs_input_file);
+    defer allocator.free(file_relative_path);
+
     // Discover package name from build.zig.zon
-    const pkg_name = discoverPackageName(allocator, project_root) catch |err| blk: {
+    const pkg_name = discoverPackageName(allocator, workspace_root) catch |err| blk: {
         if (std.posix.getenv("COG_ZIG_DEBUG") != null) {
             std.debug.print("debug: could not read build.zig.zon ({s}), using directory name fallback\n", .{@errorName(err)});
         }
-        break :blk dirBasename(project_root);
+        break :blk dirBasename(workspace_root);
     };
     defer if (pkg_name.allocated) allocator.free(pkg_name.name);
-
-    // Discover root source file (absolute path)
-    const root_source = discoverRootSource(allocator, project_root) orelse {
-        std.debug.print("Error: could not find root source file in {s}\n", .{project_root});
-        process.exit(1);
-    };
-    defer allocator.free(root_source);
 
     const out_file = try fs.cwd().createFile(output_path.?, .{});
     defer out_file.close();
@@ -76,23 +89,24 @@ pub fn main() !void {
     const tool_args = [_][]const u8{
         "cog-zig",
         "--root-path",
-        project_root,
+        workspace_root,
         "--pkg",
         pkg_name.name,
-        root_source,
+        abs_input_file,
         "--root-pkg",
         pkg_name.name,
     };
     const packages = [_]scip.PackageSpec{
-        .{ .name = pkg_name.name, .path = root_source },
+        .{ .name = pkg_name.name, .path = abs_input_file },
     };
 
     try scip.run(.{
-        .root_path = project_root,
+        .root_path = workspace_root,
         .root_pkg = pkg_name.name,
         .packages = &packages,
         .tool_name = "cog-zig",
         .tool_arguments = &tool_args,
+        .single_document_relative_path = file_relative_path,
     }, allocator, &file_writer.interface);
 
     try file_writer.interface.flush();
@@ -188,21 +202,40 @@ pub fn dirBasename(path: []const u8) PackageName {
     return .{ .name = basename, .allocated = false };
 }
 
-pub fn discoverRootSource(allocator: mem.Allocator, project_root: []const u8) ?[]const u8 {
-    const candidates = [_][]const u8{
-        "src/main.zig",
-        "src/root.zig",
-        "src/lib.zig",
-        "build.zig",
-    };
-    var dir = fs.cwd().openDir(project_root, .{}) catch return null;
-    defer dir.close();
+const PathKind = enum {
+    file,
+    directory,
+    missing,
+};
 
-    for (candidates) |candidate| {
-        dir.access(candidate, .{}) catch continue;
-        return fs.path.join(allocator, &.{ project_root, candidate }) catch continue;
+fn pathKind(path: []const u8) PathKind {
+    const stat = fs.cwd().statFile(path) catch return .missing;
+    return switch (stat.kind) {
+        .directory => .directory,
+        else => .file,
+    };
+}
+
+fn findWorkspaceRoot(allocator: mem.Allocator, start_dir: []const u8) ![]const u8 {
+    var current = try allocator.dupe(u8, start_dir);
+    errdefer allocator.free(current);
+
+    while (true) {
+        const zon_path = try fs.path.join(allocator, &.{ current, "build.zig.zon" });
+        defer allocator.free(zon_path);
+        if (pathKind(zon_path) == .file) {
+            return current;
+        }
+
+        const maybe_parent = fs.path.dirname(current);
+        if (maybe_parent == null or std.mem.eql(u8, maybe_parent.?, current)) {
+            return current;
+        }
+
+        const parent = try allocator.dupe(u8, maybe_parent.?);
+        allocator.free(current);
+        current = parent;
     }
-    return null;
 }
 
 test "parseDotName parses enum-style package name" {
@@ -227,18 +260,39 @@ test "parseStringName normalizes hyphenated package names" {
     try std.testing.expectEqualStrings("cog_zig", name);
 }
 
-test "discoverRootSource prefers src/main.zig" {
+test "findWorkspaceRoot walks to build.zig.zon" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("src");
-    try tmp.dir.writeFile(.{ .sub_path = "src/main.zig", .data = "pub fn main() void {}\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "build.zig", .data = "pub fn build(_: *anyopaque) void {}\n" });
+    try tmp.dir.makePath("workspace/src/nested");
+    try tmp.dir.writeFile(.{ .sub_path = "workspace/build.zig.zon", .data = ".{ .name = .workspace, .version = \"0.0.0\" }\n" });
 
     const abs_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(abs_root);
+    const nested = try fs.path.join(std.testing.allocator, &.{ abs_root, "workspace", "src", "nested" });
+    defer std.testing.allocator.free(nested);
 
-    const source = discoverRootSource(std.testing.allocator, abs_root) orelse return error.TestUnexpectedResult;
-    defer std.testing.allocator.free(source);
-    try std.testing.expect(std.mem.endsWith(u8, source, "src/main.zig"));
+    const discovered = try findWorkspaceRoot(std.testing.allocator, nested);
+    defer std.testing.allocator.free(discovered);
+
+    try std.testing.expect(std.mem.endsWith(u8, discovered, "workspace"));
+}
+
+test "pathKind distinguishes file and directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("a_dir");
+    try tmp.dir.writeFile(.{ .sub_path = "a_file.zig", .data = "pub fn main() void {}\n" });
+
+    const abs_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(abs_root);
+    const abs_dir = try fs.path.join(std.testing.allocator, &.{ abs_root, "a_dir" });
+    defer std.testing.allocator.free(abs_dir);
+    const abs_file = try fs.path.join(std.testing.allocator, &.{ abs_root, "a_file.zig" });
+    defer std.testing.allocator.free(abs_file);
+
+    try std.testing.expectEqual(PathKind.directory, pathKind(abs_dir));
+    try std.testing.expectEqual(PathKind.file, pathKind(abs_file));
+    try std.testing.expectEqual(PathKind.missing, pathKind("/this/path/should/not/exist-12345"));
 }

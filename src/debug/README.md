@@ -15,7 +15,7 @@ This directory contains debug-focused documentation, fixtures, and tests for the
 zig build
 zig build test
 zig build -Doptimize=ReleaseFast
-bin/cog-zig /path/to/zig/project --output /tmp/index.scip
+bin/cog-zig /path/to/file.zig --output /tmp/index.scip
 ```
 
 Expected:

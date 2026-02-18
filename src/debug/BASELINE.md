@@ -6,9 +6,9 @@ indexing integration.
 ## Indexing Baseline
 
 - Entry binary: `bin/cog-zig`
-- Contract: `cog-zig <project_root> --output <path>`
+- Contract: `cog-zig <file_path> --output <path>`
 - Output: SCIP protobuf written to `<path>`
-- Runtime model: in-process call into `src/scip/main.zig`
+- Runtime model: in-process call into `src/scip/main.zig` with single-document filtering
 
 ## Logging Baseline
 

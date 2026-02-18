@@ -80,19 +80,20 @@ Version and build-mode expectations are tracked in `src/debug/tests/zig_version_
 
 ## How It Works
 
-The wrapper binary (`bin/cog-zig`) translates Cog's calling convention to the bundled scip-zig indexer API:
+The wrapper binary (`bin/cog-zig`) translates Cog's per-file calling convention to the bundled scip-zig indexer API:
 
 ```
-cog invokes:      bin/cog-zig <project_root> --output <output_path>
-wrapper executes: in-process scip indexing with root path, package name, and root source
+cog invokes:      bin/cog-zig <file_path> --output <output_path>
+wrapper executes: in-process indexing for exactly one document
 ```
 
 **Auto-discovery:**
 
 | Step | Logic |
 |------|-------|
-| Package name | Parsed from `build.zig.zon` `.name` field. Falls back to directory name. |
-| Root source | Checks `src/main.zig` → `src/root.zig` → `src/lib.zig` → `build.zig` |
+| Workspace root | Walks up from input file until a directory containing `build.zig.zon` is found (fallback: file parent directory). |
+| Package name | Parsed from workspace `build.zig.zon` `.name` field. Falls back to workspace directory name. |
+| Indexed target | The exact file passed in `{file}`; output contains one document |
 
 ---
 
@@ -117,6 +118,7 @@ Produces two binaries in `zig-out/bin/`:
 zig build                                    # Debug build
 zig build test                               # Unit + contract tests
 bin/cog-zig /path/to/project --output /tmp/index.scip  # Test indexing
+bin/cog-zig /path/to/file.zig --output /tmp/index.scip # Per-file indexing
 ```
 
 Validation assets live under `src/debug/`:

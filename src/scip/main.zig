@@ -40,6 +40,7 @@ pub const RunConfig = struct {
     tool_name: []const u8 = "scip-zig",
     tool_version: []const u8 = "unversioned",
     tool_arguments: []const []const u8 = &.{},
+    single_document_relative_path: ?[]const u8 = null,
 };
 
 pub fn run(config: RunConfig, allocator: std.mem.Allocator, writer: anytype) !void {
@@ -73,6 +74,9 @@ pub fn run(config: RunConfig, allocator: std.mem.Allocator, writer: anytype) !vo
         }
         documents.deinit(allocator);
     }
+
+    try filterDocumentsForSinglePath(&documents, config.single_document_relative_path);
+
     var external_symbols = try StoreToScip.collectExternalSymbols(allocator, documents, config.root_pkg, &doc_store);
     defer external_symbols.deinit(allocator);
 
@@ -95,6 +99,27 @@ pub fn run(config: RunConfig, allocator: std.mem.Allocator, writer: anytype) !vo
         .documents = documents,
         .external_symbols = external_symbols,
     }, writer);
+}
+
+fn filterDocumentsForSinglePath(documents: *std.ArrayListUnmanaged(scip.Document), maybe_target_path: ?[]const u8) !void {
+    const target_path = maybe_target_path orelse return;
+
+    var target_index: ?usize = null;
+    for (documents.items, 0..) |doc, idx| {
+        if (std.mem.eql(u8, doc.relative_path, target_path)) {
+            target_index = idx;
+            break;
+        }
+    }
+
+    const idx = target_index orelse return error.TargetDocumentNotFound;
+    if (idx != 0) {
+        const keep = documents.items[idx];
+        const first = documents.items[0];
+        documents.items[0] = keep;
+        documents.items[idx] = first;
+    }
+    documents.items.len = 1;
 }
 
 pub fn main() !void {
@@ -427,4 +452,26 @@ test "deterministic SCIP output for indexing fixtures" {
 
     try std.testing.expectEqual(first.len, second.len);
     try std.testing.expect(std.mem.eql(u8, first, second));
+}
+
+test "single-document filter keeps only requested document" {
+    var docs = std.ArrayListUnmanaged(scip.Document){};
+    defer docs.deinit(std.testing.allocator);
+
+    try docs.append(std.testing.allocator, .{
+        .language = "zig",
+        .relative_path = "src/a.zig",
+        .occurrences = .{},
+        .symbols = .{},
+    });
+    try docs.append(std.testing.allocator, .{
+        .language = "zig",
+        .relative_path = "src/b.zig",
+        .occurrences = .{},
+        .symbols = .{},
+    });
+
+    try filterDocumentsForSinglePath(&docs, "src/b.zig");
+    try std.testing.expectEqual(@as(usize, 1), docs.items.len);
+    try std.testing.expectEqualStrings("src/b.zig", docs.items[0].relative_path);
 }
