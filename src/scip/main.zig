@@ -20,14 +20,6 @@ pub const std_options = std.Options{
     .logFn = logFn,
 };
 
-const ArgState = enum {
-    none,
-    add_package_name,
-    add_package_path,
-    root_name,
-    root_path,
-};
-
 pub const PackageSpec = struct {
     name: []const u8,
     path: []const u8,
@@ -120,101 +112,6 @@ fn filterDocumentsForSinglePath(documents: *std.ArrayListUnmanaged(scip.Document
         documents.items[idx] = first;
     }
     documents.items.len = 1;
-}
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var cwd_buf: [std.posix.PATH_MAX]u8 = undefined;
-
-    var root_path: []const u8 = try std.posix.getcwd(&cwd_buf);
-    var root_name: ?[]const u8 = null;
-    var package_name: ?[]const u8 = null;
-    var root_path_set: bool = false;
-
-    var arg_state: ArgState = .none;
-    var arg_iterator = try std.process.ArgIterator.initWithAllocator(allocator);
-    defer arg_iterator.deinit();
-
-    // Save arguments during first pass for tool_info
-    var saved_args = std.ArrayListUnmanaged([]const u8){};
-    defer saved_args.deinit(allocator);
-
-    var packages = std.ArrayListUnmanaged(PackageSpec){};
-    defer packages.deinit(allocator);
-
-    while (arg_iterator.next()) |arg| {
-        try saved_args.append(allocator, arg);
-        switch (arg_state) {
-            .none => {
-                if (std.mem.eql(u8, arg, "--pkg")) arg_state = .add_package_name;
-                if (std.mem.eql(u8, arg, "--root-pkg")) arg_state = .root_name;
-                if (std.mem.eql(u8, arg, "--root-path")) arg_state = .root_path;
-            },
-            .add_package_name => {
-                package_name = arg;
-                arg_state = .add_package_path;
-            },
-            .add_package_path => {
-                try packages.append(allocator, .{ .name = package_name.?, .path = arg });
-                arg_state = .none;
-            },
-            .root_name => {
-                if (root_name != null) std.log.err("Multiple roots detected; this invocation may not behave as expected!", .{});
-                root_name = arg;
-                arg_state = .none;
-            },
-            .root_path => {
-                if (root_path_set) std.log.err("Multiple root paths detected; this invocation may not behave as expected!", .{});
-                root_path_set = true;
-                root_path = arg;
-                arg_state = .none;
-            },
-        }
-    }
-
-    // Validate that arg parsing completed cleanly
-    switch (arg_state) {
-        .none => {},
-        .add_package_name => {
-            std.log.err("--pkg requires <name> <path> arguments", .{});
-            return;
-        },
-        .add_package_path => {
-            std.log.err("--pkg requires a path after the package name", .{});
-            return;
-        },
-        .root_name => {
-            std.log.err("--root-pkg requires a package name argument", .{});
-            return;
-        },
-        .root_path => {
-            std.log.err("--root-path requires a path argument", .{});
-            return;
-        },
-    }
-
-    if (root_name == null) {
-        std.log.err("Please specify a root package name with --root-pkg!", .{});
-        return;
-    }
-
-    var index = try std.fs.cwd().createFile("index.scip", .{});
-    defer index.close();
-
-    var write_buf: [4096]u8 = undefined;
-    var file_writer = index.writer(&write_buf);
-
-    try run(.{
-        .root_path = root_path,
-        .root_pkg = root_name.?,
-        .packages = packages.items,
-        .tool_arguments = saved_args.items,
-    }, allocator, &file_writer.interface);
-
-    try file_writer.interface.flush();
 }
 
 test {

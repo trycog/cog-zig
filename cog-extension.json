@@ -2,7 +2,7 @@
   "name": "cog-zig",
   "extensions": [".zig", ".zon"],
   "args": ["{file}", "--output", "{output}"],
-  "build": "zig build -Doptimize=ReleaseFast && mkdir -p bin && cp zig-out/bin/cog-zig bin/cog-zig && cp zig-out/bin/scip-zig bin/scip-zig",
+  "build": "zig build -Doptimize=ReleaseFast && mkdir -p bin && cp zig-out/bin/cog-zig bin/cog-zig",
   "debugger": {
     "type": "native",
     "boundary_markers": ["std.start", "__zig_return_address"]
