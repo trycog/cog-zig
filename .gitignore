@@ -1,3 +1,8 @@
-.zig-cache/
+.cog/
+ache/
 zig-out/
 bin/
+.claude/
+.mcp.json
+.zig-cache/
+opencode.*
