@@ -2,7 +2,7 @@
 
 # cog-zig
 
-**Zig language extension for [Cog](https://github.com/bcardarella/cog).**
+**Zig language extension for [Cog](https://github.com/trycog/cog-cli).**
 
 SCIP-based code intelligence and native DWARF debugging for Zig projects.
 
@@ -17,12 +17,12 @@ SCIP-based code intelligence and native DWARF debugging for Zig projects.
 ### Prerequisites
 
 - [Zig 0.15.0+](https://ziglang.org/download/)
-- [Cog](https://github.com/bcardarella/cog) CLI installed
+- [Cog](https://github.com/trycog/cog-cli) CLI installed
 
 ### Install
 
 ```sh
-cog install https://github.com/bcardarella/cog-zig.git
+cog install https://github.com/trycog/cog-zig.git
 ```
 
 This clones the repo, builds with `zig build -Doptimize=ReleaseFast`, and installs to `~/.config/cog/extensions/cog-zig/`.
@@ -31,19 +31,35 @@ This clones the repo, builds with `zig build -Doptimize=ReleaseFast`, and instal
 
 ## Code Intelligence
 
-Index Zig source files in your project:
+Configure file patterns in `.cog/settings.json`:
+
+```json
+{
+  "code": {
+    "index": [
+      "src/**/*.zig",
+      "build.zig.zon",
+      "build.zig"
+    ]
+  }
+}
+```
+
+Then build the index:
 
 ```sh
-cog code/index "**/*.zig"
+cog code:index
 ```
 
 Query symbols:
 
 ```sh
-cog code/query --find "main"
-cog code/query --refs "allocator" --limit 20
-cog code/query --symbols src/main.zig
+cog code:query --find "main"
+cog code:query --refs "allocator"
+cog code:query --symbols src/main.zig
 ```
+
+A built-in file watcher automatically keeps the index up to date as files change — no manual re-indexing needed after the initial build.
 
 | File Type | Capabilities |
 |-----------|--------------|
@@ -78,7 +94,7 @@ The built-in SCIP indexer supports:
 Start the MCP debug server:
 
 ```sh
-cog debug/serve
+cog debug:serve
 ```
 
 Launch a debug-built Zig binary through the debug server for breakpoints, stepping, and variable inspection.
