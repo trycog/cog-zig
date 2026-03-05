@@ -105,6 +105,7 @@ pub fn loadFile(store: *DocumentStore, package: []const u8, path: []const u8) !*
     defer _ = package_entry.value_ptr.loading.remove(path);
 
     const path_duped = try store.allocator.dupe(u8, path);
+    errdefer store.allocator.free(path_duped);
 
     const concat_path = try std.fs.path.join(store.allocator, &.{ store.root_path, path });
     defer store.allocator.free(concat_path);
@@ -129,9 +130,11 @@ pub fn loadFile(store: *DocumentStore, package: []const u8, path: []const u8) !*
 
     // Build line index for O(log n) position lookups
     const line_index = try offsets.LineIndex.build(store.allocator, text);
+    errdefer store.allocator.free(line_index.line_offsets);
 
     // Pre-scan for @import nodes
     var import_nodes = std.ArrayListUnmanaged(std.zig.Ast.Node.Index){};
+    errdefer import_nodes.deinit(store.allocator);
     for (tree.nodes.items(.tag), 0..) |tag, i| {
         switch (tag) {
             .builtin_call,
@@ -159,9 +162,12 @@ pub fn loadFile(store: *DocumentStore, package: []const u8, path: []const u8) !*
         .line_index = line_index,
     };
 
-    try store.packages.getEntry(package).?.value_ptr.handles.put(store.allocator, path_duped, handle);
-
+    // Initialize analyzer before inserting into the map. The loading map
+    // handles cycle detection. If init fails, errdefers clean up correctly
+    // since the handle isn't in the map yet (no dangling pointer).
     try handle.analyzer.init();
+
+    try store.packages.getEntry(package).?.value_ptr.handles.put(store.allocator, path_duped, handle);
 
     return handle;
 }

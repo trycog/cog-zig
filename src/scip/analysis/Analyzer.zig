@@ -722,9 +722,10 @@ pub fn newContainerScope(
         _ = analyzer.handle.document_store.resolveImportHandle(analyzer.handle, import_str[1 .. import_str.len - 1]) catch |err| {
             if (err == error.ImportCycle) {
                 logger.warn("Import cycle detected for {s} in {s}", .{ import_str, analyzer.handle.path });
-                continue;
+            } else {
+                logger.warn("Failed to resolve import {s} in {s}: {s}", .{ import_str, analyzer.handle.path, @errorName(err) });
             }
-            return err;
+            continue;
         };
     }
 
