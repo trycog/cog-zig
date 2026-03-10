@@ -66,8 +66,9 @@ A built-in file watcher automatically keeps the index up to date as files change
 | `.zig` | Go-to-definition, find references, symbol search, project structure |
 | `.zon` | Project discovery metadata (package/root inference), not symbol indexing |
 
-By default, successful indexing runs are quiet (no stdout/stderr). Set
-`COG_ZIG_DEBUG=1` to enable verbose diagnostics.
+By default, successful indexing emits only structured progress events on
+stderr so Cog can update file-by-file progress. Set `COG_ZIG_DEBUG=1` to
+enable additional verbose diagnostics.
 
 ### Indexing Features
 
@@ -114,20 +115,22 @@ Version and build-mode expectations are tracked in `src/debug/tests/zig_version_
 
 ## How It Works
 
-Cog invokes `cog-zig` once per file. The wrapper discovers the project context and runs the indexer in-process:
+Cog invokes `cog-zig` once per extension group. It expands matched files onto
+argv, the wrapper indexes them in bulk, and it emits per-file progress events
+on stderr as each file finishes:
 
 ```
-cog invokes:      bin/cog-zig <file_path> --output <output_path>
-wrapper executes: in-process SCIP indexing for exactly one document
+cog invokes:      bin/cog-zig --output <output_path> <file_path> [file_path ...]
+wrapper executes: in-process SCIP indexing for one or more documents
 ```
 
 **Auto-discovery:**
 
 | Step | Logic |
 |------|-------|
-| Workspace root | Walks up from input file until a directory containing `build.zig.zon` is found (fallback: file parent directory). |
+| Workspace root | Walks up from each input file until a directory containing `build.zig.zon` is found (fallback: file parent directory). |
 | Package name | Parsed from workspace `build.zig.zon` `.name` field (both `.identifier` and `"string"` forms). Falls back to workspace directory name. |
-| Indexed target | The exact file passed in `{file}`; output is a SCIP protobuf containing one document. |
+| Indexed target | Every file expanded from `{files}`; output is one SCIP protobuf containing one document per input file. |
 
 ### Architecture
 
@@ -172,7 +175,7 @@ Tests cover protobuf encoding/decoding, fixture-based indexing (chained field ac
 
 ```sh
 zig build
-bin/cog-zig /path/to/file.zig --output /tmp/index.scip
+bin/cog-zig --output /tmp/index.scip /path/to/file.zig /path/to/other.zig
 ```
 
 ---

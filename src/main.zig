@@ -2,7 +2,9 @@ const std = @import("std");
 const fs = std.fs;
 const mem = std.mem;
 const process = std.process;
-const scip = @import("scip/main.zig");
+const scip_main = @import("scip/main.zig");
+const scip_types = @import("scip/scip.zig");
+const protobruh = @import("scip/protobruh.zig");
 
 fn logFn(
     comptime level: std.log.Level,
@@ -24,54 +26,115 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
-    // Parse args: <file_path> --output <output_path>
+    // Parse args: --output <output_path> <file_path> [file_path ...]
     const args = try process.argsAlloc(allocator);
     defer process.argsFree(allocator, args);
 
     if (args.len < 4) {
-        std.debug.print("Usage: cog-zig <file_path> --output <output_path>\n", .{});
+        std.debug.print("Usage: cog-zig --output <output_path> <file_path> [file_path ...]\n", .{});
         process.exit(1);
     }
 
-    const input_path = args[1];
     var output_path: ?[]const u8 = null;
+    var file_paths = std.ArrayListUnmanaged([]const u8){};
+    defer file_paths.deinit(allocator);
 
-    var i: usize = 2;
+    var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (mem.eql(u8, args[i], "--output")) {
             i += 1;
             if (i < args.len) {
                 output_path = args[i];
             }
+        } else {
+            try file_paths.append(allocator, args[i]);
         }
     }
 
-    if (output_path == null) {
-        std.debug.print("Error: --output <path> is required\n", .{});
+    if (output_path == null or file_paths.items.len == 0) {
+        std.debug.print("Error: --output <path> and at least one file path are required\n", .{});
         process.exit(1);
     }
 
-    const input_kind = pathKind(input_path);
-    if (input_kind != .file) {
-        std.debug.print("Error: expected a file path, got non-file input: {s}\n", .{input_path});
-        process.exit(1);
+    var collected_documents = std.ArrayListUnmanaged(scip_types.Document){};
+    defer collected_documents.deinit(allocator);
+    var collected_external_symbols = std.ArrayListUnmanaged(scip_types.SymbolInformation){};
+    defer collected_external_symbols.deinit(allocator);
+
+    var metadata_root: ?[]const u8 = null;
+
+    for (file_paths.items) |input_path| {
+        const single_result = indexSingleFile(allocator, input_path, args) catch |err| {
+            emitProgress("file_error", input_path);
+            if (std.posix.getenv("COG_ZIG_DEBUG") != null) {
+                std.debug.print("debug: failed to index {s}: {s}\n", .{ input_path, @errorName(err) });
+            }
+            continue;
+        };
+
+        if (metadata_root == null) {
+            metadata_root = try allocator.dupe(u8, single_result.index.metadata.project_root);
+        }
+
+        for (single_result.index.documents.items) |doc| {
+            try collected_documents.append(allocator, doc);
+        }
+        for (single_result.index.external_symbols.items) |sym| {
+            try collected_external_symbols.append(allocator, sym);
+        }
+
+        emitProgress("file_done", single_result.relative_path);
     }
+
+    const project_root = metadata_root orelse blk: {
+        const cwd = try fs.cwd().realpathAlloc(allocator, ".");
+        defer allocator.free(cwd);
+        break :blk try std.fmt.allocPrint(allocator, "file://{s}", .{cwd});
+    };
+    defer allocator.free(project_root);
+
+    const out_file = try fs.cwd().createFile(output_path.?, .{});
+    defer out_file.close();
+
+    var write_buf: [4096]u8 = undefined;
+    var file_writer = out_file.writer(&write_buf);
+
+    try protobruh.encode(scip_types.Index{
+        .metadata = .{
+            .version = .unspecified_protocol_version,
+            .tool_info = .{
+                .name = "cog-zig",
+                .version = "unversioned",
+                .arguments = .{},
+            },
+            .project_root = project_root,
+            .text_document_encoding = .utf8,
+        },
+        .documents = collected_documents,
+        .external_symbols = collected_external_symbols,
+    }, &file_writer.interface);
+
+    try file_writer.interface.flush();
+}
+
+const SingleIndexResult = struct {
+    index: scip_types.Index,
+    relative_path: []const u8,
+};
+
+fn indexSingleFile(allocator: mem.Allocator, input_path: []const u8, full_args: []const []const u8) !SingleIndexResult {
+    const input_kind = pathKind(input_path);
+    if (input_kind != .file) return error.InvalidInput;
 
     const abs_input_file = try fs.cwd().realpathAlloc(allocator, input_path);
     defer allocator.free(abs_input_file);
 
-    const file_dir = fs.path.dirname(abs_input_file) orelse {
-        std.debug.print("Error: cannot determine parent directory for input file: {s}\n", .{input_path});
-        process.exit(1);
-    };
-
+    const file_dir = fs.path.dirname(abs_input_file) orelse return error.InvalidInput;
     const workspace_root = try findWorkspaceRoot(allocator, file_dir);
     defer allocator.free(workspace_root);
 
     const file_relative_path = try fs.path.relative(allocator, workspace_root, abs_input_file);
-    defer allocator.free(file_relative_path);
 
-    // Discover package name from build.zig.zon
     const pkg_name = discoverPackageName(allocator, workspace_root) catch |err| blk: {
         if (std.posix.getenv("COG_ZIG_DEBUG") != null) {
             std.debug.print("debug: could not read build.zig.zon ({s}), using directory name fallback\n", .{@errorName(err)});
@@ -80,36 +143,69 @@ pub fn main() !void {
     };
     defer if (pkg_name.allocated) allocator.free(pkg_name.name);
 
-    const out_file = try fs.cwd().createFile(output_path.?, .{});
-    defer out_file.close();
+    var out = std.io.Writer.Allocating.init(allocator);
+    defer out.deinit();
 
-    var write_buf: [4096]u8 = undefined;
-    var file_writer = out_file.writer(&write_buf);
-
-    const tool_args = [_][]const u8{
-        "cog-zig",
-        "--root-path",
-        workspace_root,
-        "--pkg",
-        pkg_name.name,
-        abs_input_file,
-        "--root-pkg",
-        pkg_name.name,
-    };
-    const packages = [_]scip.PackageSpec{
+    const packages = [_]scip_main.PackageSpec{
         .{ .name = pkg_name.name, .path = abs_input_file },
     };
 
-    try scip.run(.{
+    try scip_main.run(.{
         .root_path = workspace_root,
         .root_pkg = pkg_name.name,
         .packages = &packages,
         .tool_name = "cog-zig",
-        .tool_arguments = &tool_args,
+        .tool_arguments = full_args,
         .single_document_relative_path = file_relative_path,
-    }, allocator, &file_writer.interface);
+    }, allocator, &out.writer);
 
-    try file_writer.interface.flush();
+    var fbs = std.io.fixedBufferStream(out.written());
+    const index = try protobruh.decode(scip_types.Index, allocator, fbs.reader());
+    return .{ .index = index, .relative_path = file_relative_path };
+}
+
+fn emitProgress(event: []const u8, path: []const u8) void {
+    var escaped_buf: [4096]u8 = undefined;
+    const escaped = escapeJson(&escaped_buf, path);
+    std.debug.print("{{\"type\":\"progress\",\"event\":\"{s}\",\"path\":\"{s}\"}}\n", .{ event, escaped });
+}
+
+fn escapeJson(buf: []u8, input: []const u8) []const u8 {
+    var out_idx: usize = 0;
+    for (input) |c| {
+        switch (c) {
+            '\\', '"' => {
+                if (out_idx + 2 > buf.len) break;
+                buf[out_idx] = '\\';
+                buf[out_idx + 1] = c;
+                out_idx += 2;
+            },
+            '\n' => {
+                if (out_idx + 2 > buf.len) break;
+                buf[out_idx] = '\\';
+                buf[out_idx + 1] = 'n';
+                out_idx += 2;
+            },
+            '\r' => {
+                if (out_idx + 2 > buf.len) break;
+                buf[out_idx] = '\\';
+                buf[out_idx + 1] = 'r';
+                out_idx += 2;
+            },
+            '\t' => {
+                if (out_idx + 2 > buf.len) break;
+                buf[out_idx] = '\\';
+                buf[out_idx + 1] = 't';
+                out_idx += 2;
+            },
+            else => {
+                if (out_idx + 1 > buf.len) break;
+                buf[out_idx] = c;
+                out_idx += 1;
+            },
+        }
+    }
+    return buf[0..out_idx];
 }
 
 const PackageName = struct {

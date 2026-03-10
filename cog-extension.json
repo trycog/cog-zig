@@ -1,7 +1,7 @@
 {
   "name": "cog-zig",
   "extensions": [".zig", ".zon"],
-  "args": ["{file}", "--output", "{output}"],
+  "args": ["--output", "{output}", "{files}"],
   "build": "zig build -Doptimize=ReleaseFast && mkdir -p bin && cp zig-out/bin/cog-zig bin/cog-zig",
   "debugger": {
     "type": "native",

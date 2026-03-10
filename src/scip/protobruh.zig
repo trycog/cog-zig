@@ -184,6 +184,11 @@ fn decodeInternal(
             .unsigned => try std.leb.readUleb128(T, reader),
         },
         .bool => value.* = ((try std.leb.readUleb128(usize, reader)) != 0),
+        .optional => |opt| {
+            var child: opt.child = undefined;
+            try decodeInternal(opt.child, &child, allocator, reader, false);
+            value.* = child;
+        },
         .array => |arr| {
             const Child = arr.child;
             const cti = @typeInfo(Child);
