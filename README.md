@@ -178,6 +178,18 @@ zig build
 bin/cog-zig --output /tmp/index.scip /path/to/file.zig /path/to/other.zig
 ```
 
+### Indexing diagnostics
+
+Enable verbose indexing diagnostics with:
+
+```sh
+COG_ZIG_DEBUG=1 bin/cog-zig --output /tmp/index.scip /path/to/file.zig 2> /tmp/cog-zig-debug.log
+```
+
+With `COG_ZIG_DEBUG=1`, the wrapper emits per-file timing, SCIP run/decode phase
+timings, and process resource-usage snapshots to help diagnose hangs or heavy
+files.
+
 ---
 
 ## Acknowledgments

@@ -25,6 +25,7 @@ pub fn main() !void {
     var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
+    const index_start_ms = std.time.milliTimestamp();
 
     // Parse args: --output <output_path> <file_path> [file_path ...]
     const args = try process.argsAlloc(allocator);
@@ -56,6 +57,9 @@ pub fn main() !void {
         process.exit(1);
     }
 
+    debugLog("index:start files={d}", .{file_paths.items.len});
+    logResourceUsage("index:start");
+
     var collected_documents = std.ArrayListUnmanaged(scip_types.Document){};
     defer collected_documents.deinit(allocator);
     var collected_external_symbols = std.ArrayListUnmanaged(scip_types.SymbolInformation){};
@@ -64,8 +68,13 @@ pub fn main() !void {
     var metadata_root: ?[]const u8 = null;
 
     for (file_paths.items) |input_path| {
+        const file_start_ms = std.time.milliTimestamp();
+        debugLog("file:start path={s}", .{input_path});
+        logResourceUsage("file:start");
         const single_result = indexSingleFile(allocator, input_path, args) catch |err| {
             emitProgress("file_error", input_path);
+            debugLog("file:error path={s} err={s} elapsed_ms={d}", .{ input_path, @errorName(err), std.time.milliTimestamp() - file_start_ms });
+            logResourceUsage("file:error");
             if (std.posix.getenv("COG_ZIG_DEBUG") != null) {
                 std.debug.print("debug: failed to index {s}: {s}\n", .{ input_path, @errorName(err) });
             }
@@ -84,6 +93,8 @@ pub fn main() !void {
         }
 
         emitProgress("file_done", single_result.relative_path);
+        debugLog("file:done path={s} elapsed_ms={d} docs={d} external_symbols={d}", .{ single_result.relative_path, std.time.milliTimestamp() - file_start_ms, single_result.index.documents.items.len, single_result.index.external_symbols.items.len });
+        logResourceUsage("file:done");
     }
 
     const project_root = metadata_root orelse blk: {
@@ -115,6 +126,8 @@ pub fn main() !void {
     }, &file_writer.interface);
 
     try file_writer.interface.flush();
+    debugLog("index:done files={d} elapsed_ms={d}", .{ file_paths.items.len, std.time.milliTimestamp() - index_start_ms });
+    logResourceUsage("index:done");
 }
 
 const SingleIndexResult = struct {
@@ -125,6 +138,7 @@ const SingleIndexResult = struct {
 fn indexSingleFile(allocator: mem.Allocator, input_path: []const u8, full_args: []const []const u8) !SingleIndexResult {
     const input_kind = pathKind(input_path);
     if (input_kind != .file) return error.InvalidInput;
+    const file_start_ms = std.time.milliTimestamp();
 
     const abs_input_file = try fs.cwd().realpathAlloc(allocator, input_path);
     defer allocator.free(abs_input_file);
@@ -134,6 +148,8 @@ fn indexSingleFile(allocator: mem.Allocator, input_path: []const u8, full_args: 
     defer allocator.free(workspace_root);
 
     const file_relative_path = try fs.path.relative(allocator, workspace_root, abs_input_file);
+    debugLog("indexSingleFile:start path={s} abs={s}", .{ file_relative_path, abs_input_file });
+    logResourceUsage("indexSingleFile:start");
 
     const pkg_name = discoverPackageName(allocator, workspace_root) catch |err| blk: {
         if (std.posix.getenv("COG_ZIG_DEBUG") != null) {
@@ -150,6 +166,7 @@ fn indexSingleFile(allocator: mem.Allocator, input_path: []const u8, full_args: 
         .{ .name = pkg_name.name, .path = abs_input_file },
     };
 
+    const scip_run_start_ms = std.time.milliTimestamp();
     try scip_main.run(.{
         .root_path = workspace_root,
         .root_pkg = pkg_name.name,
@@ -158,10 +175,60 @@ fn indexSingleFile(allocator: mem.Allocator, input_path: []const u8, full_args: 
         .tool_arguments = full_args,
         .single_document_relative_path = file_relative_path,
     }, allocator, &out.writer);
+    debugLog("indexSingleFile:scip_run_done path={s} elapsed_ms={d} bytes={d}", .{ file_relative_path, std.time.milliTimestamp() - scip_run_start_ms, out.written().len });
+    logResourceUsage("indexSingleFile:scip_run_done");
 
     var fbs = std.io.fixedBufferStream(out.written());
+    const decode_start_ms = std.time.milliTimestamp();
     const index = try protobruh.decode(scip_types.Index, allocator, fbs.reader());
+    debugLog("indexSingleFile:decode_done path={s} elapsed_ms={d} total_elapsed_ms={d}", .{ file_relative_path, std.time.milliTimestamp() - decode_start_ms, std.time.milliTimestamp() - file_start_ms });
+    logResourceUsage("indexSingleFile:decode_done");
     return .{ .index = index, .relative_path = file_relative_path };
+}
+
+fn debugEnabled() bool {
+    return std.posix.getenv("COG_ZIG_DEBUG") != null;
+}
+
+fn debugLog(comptime fmt: []const u8, args: anytype) void {
+    if (!debugEnabled()) return;
+    std.log.debug(fmt, args);
+}
+
+fn logResourceUsage(context: []const u8) void {
+    if (!debugEnabled()) return;
+    const usage = resourceUsage() orelse return;
+    std.log.debug(
+        "{s} rss_kb={d} user_ms={d} sys_ms={d} minflt={d} majflt={d} nvcsw={d} nivcsw={d}",
+        .{ context, usage.max_rss_kb, usage.user_ms, usage.system_ms, usage.minor_faults, usage.major_faults, usage.vol_cs, usage.invol_cs },
+    );
+}
+
+const ResourceUsage = struct {
+    user_ms: i64,
+    system_ms: i64,
+    max_rss_kb: i64,
+    minor_faults: i64,
+    major_faults: i64,
+    vol_cs: i64,
+    invol_cs: i64,
+};
+
+fn resourceUsage() ?ResourceUsage {
+    if (@TypeOf(std.c.rusage) == void) return null;
+
+    var usage: std.c.rusage = undefined;
+    if (std.c.getrusage(std.c.rusage.SELF, &usage) != 0) return null;
+
+    return .{
+        .user_ms = @as(i64, @intCast(usage.utime.sec)) * 1000 + @divTrunc(@as(i64, @intCast(usage.utime.usec)), 1000),
+        .system_ms = @as(i64, @intCast(usage.stime.sec)) * 1000 + @divTrunc(@as(i64, @intCast(usage.stime.usec)), 1000),
+        .max_rss_kb = @as(i64, @intCast(usage.maxrss)),
+        .minor_faults = @as(i64, @intCast(usage.minflt)),
+        .major_faults = @as(i64, @intCast(usage.majflt)),
+        .vol_cs = @as(i64, @intCast(usage.nvcsw)),
+        .invol_cs = @as(i64, @intCast(usage.nivcsw)),
+    };
 }
 
 fn emitProgress(event: []const u8, path: []const u8) void {
