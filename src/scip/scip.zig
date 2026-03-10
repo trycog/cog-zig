@@ -372,6 +372,7 @@ pub const Relationship = struct {
         .{ "is_implementation", 3 },
         .{ "is_type_definition", 4 },
         .{ "is_definition", 5 },
+        .{ "kind", 6 },
     };
 
     symbol: []const u8,
@@ -414,6 +415,7 @@ pub const Relationship = struct {
     /// When set to true, this relationship documents that the enclosing symbol
     /// is a definition of the referenced symbol.
     is_definition: bool = false,
+    kind: []const u8 = "",
 };
 
 /// SymbolRole declares what "role" a symbol has in an occurrence.  A role is

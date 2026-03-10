@@ -187,6 +187,66 @@ test "indexes chained field access with correct symbol roles" {
     try std.testing.expect(saw_read_reference);
 }
 
+test "emits import relationships with kinds" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("src");
+    try tmp.dir.writeFile(.{ .sub_path = "build.zig.zon", .data = 
+        \\ .{
+        \\   .name = .fixture,
+        \\   .version = "0.0.0",
+        \\   .fingerprint = 0x2222222222222222,
+        \\   .paths = .{ "src" },
+        \\ }
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "src/helper.zig", .data = 
+        \\ pub fn greet() void {}
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "src/main.zig", .data = 
+        \\ const helper = @import("helper.zig");
+        \\ fn greet() void {
+        \\     helper.greet();
+        \\ }
+        \\ pub fn run() void {
+        \\     greet();
+        \\ }
+    });
+
+    const abs_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(abs_root);
+    const abs_main = try std.fs.path.join(std.testing.allocator, &.{ abs_root, "src/main.zig" });
+    defer std.testing.allocator.free(abs_main);
+
+    var store = DocumentStore{
+        .allocator = std.testing.allocator,
+        .root_path = abs_root,
+    };
+    defer store.deinit();
+
+    try store.createPackage("fixture", abs_main);
+
+    var pkg_it = store.packages.iterator();
+    while (pkg_it.next()) |pkg_entry| {
+        var handle_it = pkg_entry.value_ptr.handles.iterator();
+        while (handle_it.next()) |h| {
+            try h.value_ptr.*.analyzer.postResolves();
+        }
+    }
+
+    const pkg = store.packages.get("fixture") orelse return error.TestUnexpectedResult;
+    const root_handle = pkg.handles.get(pkg.root_relative) orelse return error.TestUnexpectedResult;
+
+    var saw_import = false;
+    for (root_handle.analyzer.symbols.items) |sym| {
+        for (sym.relationships.items) |rel| {
+            if (std.mem.eql(u8, rel.kind, "imports")) saw_import = true;
+        }
+    }
+
+    try std.testing.expect(saw_import);
+}
+
 fn analyzeFixtureMain(allocator: std.mem.Allocator, fixture_rel_root: []const u8, package_name: []const u8) !*DocumentStore.Handle {
     const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
     defer allocator.free(cwd);

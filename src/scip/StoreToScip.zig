@@ -100,7 +100,7 @@ pub fn collectExternalSymbols(
                     try external_symbols.append(allocator, .{
                         .symbol = sym,
                         .documentation = src_info.documentation,
-                        .relationships = .{},
+                        .relationships = src_info.relationships,
                         .kind = src_info.kind,
                         .display_name = src_info.display_name,
                     });

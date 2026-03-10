@@ -21,6 +21,7 @@ write_tokens: std.AutoHashMapUnmanaged(Ast.TokenIndex, void) = .{},
 
 symbols: std.ArrayListUnmanaged(scip.SymbolInformation) = .{},
 occurrences: std.ArrayListUnmanaged(scip.Occurrence) = .{},
+file_relationships: std.ArrayListUnmanaged(scip.Relationship) = .{},
 
 local_counter: usize = 0,
 
@@ -55,6 +56,7 @@ pub fn deinit(analyzer: *Analyzer) void {
         sym.relationships.deinit(analyzer.allocator);
     }
     analyzer.symbols.deinit(analyzer.allocator);
+    analyzer.file_relationships.deinit(analyzer.allocator);
     for (analyzer.occurrences.items) |*occ| {
         occ.range.deinit(analyzer.allocator);
         occ.enclosing_range.deinit(analyzer.allocator);
@@ -536,14 +538,19 @@ pub fn addSymbol(
 
     const comments = try utils.getDocComments(analyzer.allocator, tree, node_idx);
     const sig_text = analyzer.getSignatureText(node_idx);
+    const enclosing_symbol = analyzer.getEnclosingSymbol(scope_idx);
+    var relationships = std.ArrayListUnmanaged(scip.Relationship){};
+    if (enclosing_symbol.len == 0 and analyzer.file_relationships.items.len > 0) {
+        try relationships.appendSlice(analyzer.allocator, analyzer.file_relationships.items);
+    }
     try analyzer.symbols.append(analyzer.allocator, .{
         .symbol = symbol_name,
         .documentation = comments orelse .{},
-        .relationships = .{},
+        .relationships = relationships,
         .kind = symbol_kind,
         .display_name = utils.getDeclName(tree, node_idx) orelse "",
         .signature_documentation = if (sig_text) |text| .{ .language = "zig", .text = text } else null,
-        .enclosing_symbol = analyzer.getEnclosingSymbol(scope_idx),
+        .enclosing_symbol = enclosing_symbol,
     });
 
     // Definition of a variable or parameter is semantically a write
@@ -858,7 +865,28 @@ pub fn newContainerScope(
 
 pub fn postResolves(analyzer: *Analyzer) !void {
     for (analyzer.post_resolves.items) |pr| {
-        _ = try analyzer.resolveAndMarkDeclarationComplex(analyzer, pr.scope_idx, pr.node_idx);
+        const resolved = try analyzer.resolveAndMarkDeclarationComplex(analyzer, pr.scope_idx, pr.node_idx);
+        const tree = analyzer.handle.tree;
+        switch (tree.nodeTag(pr.node_idx)) {
+            .call, .call_comma, .call_one, .call_one_comma => {
+                if (resolved.declaration) |decl| {
+                    if (decl.symbol.len > 0) {
+                        const owner_symbol = analyzer.relationshipOwnerForScope(pr.scope_idx);
+                        if (owner_symbol.len > 0 and !std.mem.eql(u8, owner_symbol, decl.symbol)) {
+                            try analyzer.addRelationship(owner_symbol, .{
+                                .symbol = decl.symbol,
+                                .is_reference = true,
+                                .is_implementation = false,
+                                .is_type_definition = false,
+                                .is_definition = false,
+                                .kind = "calls",
+                            });
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
     }
 
     const tree = analyzer.handle.tree;
@@ -939,6 +967,8 @@ pub fn postResolves(analyzer: *Analyzer) !void {
             }
         }
     }
+
+    try analyzer.propagateRootImportRelationships();
 }
 
 /// Adds an is_type_definition relationship from a declaration symbol to a type symbol.
@@ -947,15 +977,61 @@ fn addTypeRelationship(
     decl_symbol: []const u8,
     type_symbol: []const u8,
 ) !void {
+    try analyzer.addRelationship(decl_symbol, .{
+        .symbol = type_symbol,
+        .is_reference = false,
+        .is_implementation = false,
+        .is_type_definition = true,
+        .is_definition = false,
+        .kind = "type_definition",
+    });
+}
+
+fn addRelationship(analyzer: *Analyzer, owner_symbol: []const u8, relationship: scip.Relationship) !void {
     for (analyzer.symbols.items) |*sym_info| {
-        if (std.mem.eql(u8, sym_info.symbol, decl_symbol)) {
-            try sym_info.relationships.append(analyzer.allocator, .{
-                .symbol = type_symbol,
-                .is_reference = false,
-                .is_implementation = false,
-                .is_type_definition = true,
-            });
-            break;
+        if (!std.mem.eql(u8, sym_info.symbol, owner_symbol)) continue;
+        for (sym_info.relationships.items) |existing| {
+            if (std.mem.eql(u8, existing.symbol, relationship.symbol) and
+                std.mem.eql(u8, existing.kind, relationship.kind) and
+                existing.is_reference == relationship.is_reference and
+                existing.is_implementation == relationship.is_implementation and
+                existing.is_type_definition == relationship.is_type_definition and
+                existing.is_definition == relationship.is_definition)
+            {
+                return;
+            }
+        }
+        try sym_info.relationships.append(analyzer.allocator, relationship);
+        return;
+    }
+}
+
+fn relationshipOwnerForScope(analyzer: *Analyzer, scope_idx: usize) []const u8 {
+    return analyzer.getDescriptor(scope_idx) orelse analyzer.getEnclosingSymbol(scope_idx);
+}
+
+fn propagateRootImportRelationships(analyzer: *Analyzer) !void {
+    const root_symbol = analyzer.getDescriptor(0) orelse return;
+    var root_imports = std.ArrayListUnmanaged(scip.Relationship){};
+    defer root_imports.deinit(analyzer.allocator);
+
+    for (analyzer.symbols.items) |sym_info| {
+        if (!std.mem.eql(u8, sym_info.symbol, root_symbol)) continue;
+        for (sym_info.relationships.items) |rel| {
+            if (std.mem.eql(u8, rel.kind, "imports")) {
+                try root_imports.append(analyzer.allocator, rel);
+            }
+        }
+        break;
+    }
+
+    if (root_imports.items.len == 0) return;
+
+    for (analyzer.symbols.items) |sym_info| {
+        if (std.mem.eql(u8, sym_info.symbol, root_symbol)) continue;
+        if (sym_info.enclosing_symbol.len != 0) continue;
+        for (root_imports.items) |rel| {
+            try analyzer.addRelationship(sym_info.symbol, rel);
         }
     }
 }
@@ -1254,6 +1330,23 @@ pub fn scopeIntermediate(
             try analyzer.scopeIntermediate(scope_idx, call.ast.fn_expr, scope_name);
             for (call.ast.params) |param|
                 try analyzer.scopeIntermediate(scope_idx, param, scope_name);
+
+            const resolved = try analyzer.resolveAndMarkDeclarationComplex(analyzer, scope_idx, call.ast.fn_expr);
+            if (resolved.declaration) |decl| {
+                if (decl.symbol.len > 0) {
+                    const owner_symbol = analyzer.relationshipOwnerForScope(scope_idx);
+                    if (owner_symbol.len > 0 and !std.mem.eql(u8, owner_symbol, decl.symbol)) {
+                        try analyzer.addRelationship(owner_symbol, .{
+                            .symbol = decl.symbol,
+                            .is_reference = true,
+                            .is_implementation = false,
+                            .is_type_definition = false,
+                            .is_definition = false,
+                            .kind = "calls",
+                        });
+                    }
+                }
+            }
         },
         .assign_mul,
         .assign_div,
@@ -1547,6 +1640,23 @@ pub fn scopeIntermediate(
                         .syntax_kind = .identifier_builtin,
                         .diagnostics = .{},
                     });
+                    if (import_symbol.len > 0) {
+                        const owner_symbol = analyzer.relationshipOwnerForScope(scope_idx);
+                        if (owner_symbol.len > 0) {
+                            const rel: scip.Relationship = .{
+                                .symbol = import_symbol,
+                                .is_reference = false,
+                                .is_implementation = false,
+                                .is_type_definition = false,
+                                .is_definition = false,
+                                .kind = "imports",
+                            };
+                            if (analyzer.getEnclosingSymbol(scope_idx).len == 0) {
+                                try analyzer.file_relationships.append(analyzer.allocator, rel);
+                            }
+                            try analyzer.addRelationship(owner_symbol, rel);
+                        }
+                    }
                 }
             } else {
                 // Record non-import builtin name (e.g., @intFromEnum) as syntax occurrence
