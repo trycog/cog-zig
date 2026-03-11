@@ -20,6 +20,7 @@ recorded_occurrences: std.AutoHashMapUnmanaged(Ast.TokenIndex, void) = .{},
 write_tokens: std.AutoHashMapUnmanaged(Ast.TokenIndex, void) = .{},
 
 symbols: std.ArrayListUnmanaged(scip.SymbolInformation) = .{},
+symbol_index: std.StringHashMapUnmanaged(usize) = .{},
 occurrences: std.ArrayListUnmanaged(scip.Occurrence) = .{},
 file_relationships: std.ArrayListUnmanaged(scip.Relationship) = .{},
 
@@ -56,6 +57,7 @@ pub fn deinit(analyzer: *Analyzer) void {
         sym.relationships.deinit(analyzer.allocator);
     }
     analyzer.symbols.deinit(analyzer.allocator);
+    analyzer.symbol_index.deinit(analyzer.allocator);
     analyzer.file_relationships.deinit(analyzer.allocator);
     for (analyzer.occurrences.items) |*occ| {
         occ.range.deinit(analyzer.allocator);
@@ -70,6 +72,12 @@ pub fn deinit(analyzer: *Analyzer) void {
 fn trackSymbol(analyzer: *Analyzer, symbol: []const u8) ![]const u8 {
     try analyzer.allocated_symbols.append(analyzer.allocator, symbol);
     return symbol;
+}
+
+fn appendSymbol(analyzer: *Analyzer, symbol_info: scip.SymbolInformation) !void {
+    const idx = analyzer.symbols.items.len;
+    try analyzer.symbols.append(analyzer.allocator, symbol_info);
+    try analyzer.symbol_index.put(analyzer.allocator, symbol_info.symbol, idx);
 }
 
 pub const SourceRange = std.zig.Token.Loc;
@@ -543,7 +551,7 @@ pub fn addSymbol(
     if (enclosing_symbol.len == 0 and analyzer.file_relationships.items.len > 0) {
         try relationships.appendSlice(analyzer.allocator, analyzer.file_relationships.items);
     }
-    try analyzer.symbols.append(analyzer.allocator, .{
+    try analyzer.appendSymbol(.{
         .symbol = symbol_name,
         .documentation = comments orelse .{},
         .relationships = relationships,
@@ -794,7 +802,7 @@ pub fn newContainerScope(
                         }
                         break :blk .{};
                     } else .{};
-                    try analyzer.symbols.append(analyzer.allocator, .{
+                    try analyzer.appendSymbol(.{
                         .symbol = err_symbol,
                         .documentation = err_docs,
                         .relationships = .{},
@@ -988,22 +996,20 @@ fn addTypeRelationship(
 }
 
 fn addRelationship(analyzer: *Analyzer, owner_symbol: []const u8, relationship: scip.Relationship) !void {
-    for (analyzer.symbols.items) |*sym_info| {
-        if (!std.mem.eql(u8, sym_info.symbol, owner_symbol)) continue;
-        for (sym_info.relationships.items) |existing| {
-            if (std.mem.eql(u8, existing.symbol, relationship.symbol) and
-                std.mem.eql(u8, existing.kind, relationship.kind) and
-                existing.is_reference == relationship.is_reference and
-                existing.is_implementation == relationship.is_implementation and
-                existing.is_type_definition == relationship.is_type_definition and
-                existing.is_definition == relationship.is_definition)
-            {
-                return;
-            }
+    const idx = analyzer.symbol_index.get(owner_symbol) orelse return;
+    const sym_info = &analyzer.symbols.items[idx];
+    for (sym_info.relationships.items) |existing| {
+        if (std.mem.eql(u8, existing.symbol, relationship.symbol) and
+            std.mem.eql(u8, existing.kind, relationship.kind) and
+            existing.is_reference == relationship.is_reference and
+            existing.is_implementation == relationship.is_implementation and
+            existing.is_type_definition == relationship.is_type_definition and
+            existing.is_definition == relationship.is_definition)
+        {
+            return;
         }
-        try sym_info.relationships.append(analyzer.allocator, relationship);
-        return;
     }
+    try sym_info.relationships.append(analyzer.allocator, relationship);
 }
 
 fn relationshipOwnerForScope(analyzer: *Analyzer, scope_idx: usize) []const u8 {
@@ -1221,7 +1227,7 @@ pub fn scopeIntermediate(
                     if ((try fscope.decls.fetchPut(analyzer.allocator, param_name, param_decl)) == null) {
                         // Record occurrence for the parameter definition
                         if ((try analyzer.recorded_occurrences.fetchPut(analyzer.allocator, name_token, {})) == null) {
-                            try analyzer.symbols.append(analyzer.allocator, .{
+                            try analyzer.appendSymbol(.{
                                 .symbol = param_decl.symbol,
                                 .documentation = .{},
                                 .relationships = .{},
@@ -1278,7 +1284,7 @@ pub fn scopeIntermediate(
                 const parent = &analyzer.scopes.items[scope_idx];
                 if ((try parent.decls.fetchPut(analyzer.allocator, label_name, label_decl)) == null) {
                     if ((try analyzer.recorded_occurrences.fetchPut(analyzer.allocator, first_token, {})) == null) {
-                        try analyzer.symbols.append(analyzer.allocator, .{
+                        try analyzer.appendSymbol(.{
                             .symbol = label_symbol,
                             .documentation = .{},
                             .relationships = .{},
@@ -1524,7 +1530,7 @@ pub fn scopeIntermediate(
                         };
                         if ((try analyzer.scopes.items[then_scope].decls.fetchPut(analyzer.allocator, cap_name, cap_decl)) == null) {
                             if ((try analyzer.recorded_occurrences.fetchPut(analyzer.allocator, ident, {})) == null) {
-                                try analyzer.symbols.append(analyzer.allocator, .{
+                                try analyzer.appendSymbol(.{
                                     .symbol = cap_symbol,
                                     .documentation = .{},
                                     .relationships = .{},
@@ -1575,7 +1581,7 @@ pub fn scopeIntermediate(
             // Record the test keyword token as a definition with Test role
             const test_token = tree.nodeMainToken(node_idx);
             if ((try analyzer.recorded_occurrences.fetchPut(analyzer.allocator, test_token, {})) == null) {
-                try analyzer.symbols.append(analyzer.allocator, .{
+                try analyzer.appendSymbol(.{
                     .symbol = test_symbol,
                     .documentation = .{},
                     .relationships = .{},
@@ -1923,7 +1929,7 @@ fn addPayloadScope(
 
             if ((try analyzer.scopes.items[new_scope_idx].decls.fetchPut(analyzer.allocator, name, decl)) == null) {
                 if ((try analyzer.recorded_occurrences.fetchPut(analyzer.allocator, tok, {})) == null) {
-                    try analyzer.symbols.append(analyzer.allocator, .{
+                    try analyzer.appendSymbol(.{
                         .symbol = symbol,
                         .documentation = .{},
                         .relationships = .{},
@@ -1981,7 +1987,7 @@ fn processPayloadBody(
                 const scope = &analyzer.scopes.items[payload_scope_idx];
                 if ((try scope.decls.fetchPut(analyzer.allocator, label_name, label_decl)) == null) {
                     if ((try analyzer.recorded_occurrences.fetchPut(analyzer.allocator, first_token, {})) == null) {
-                        try analyzer.symbols.append(analyzer.allocator, .{
+                        try analyzer.appendSymbol(.{
                             .symbol = label_symbol,
                             .documentation = .{},
                             .relationships = .{},

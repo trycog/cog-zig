@@ -20,6 +20,62 @@ pub const std_options = std.Options{
     .logFn = logFn,
 };
 
+fn emitPhaseProgress(phase: []const u8, done: usize, total: usize, path: ?[]const u8) void {
+    var escaped_phase_buf: [128]u8 = undefined;
+    const escaped_phase = escapeJson(&escaped_phase_buf, phase);
+    if (path) |phase_path| {
+        var escaped_path_buf: [4096]u8 = undefined;
+        const escaped_path = escapeJson(&escaped_path_buf, phase_path);
+        std.debug.print(
+            "{{\"type\":\"progress\",\"event\":\"phase\",\"phase\":\"{s}\",\"done\":{d},\"total\":{d},\"path\":\"{s}\"}}\n",
+            .{ escaped_phase, done, total, escaped_path },
+        );
+    } else {
+        std.debug.print(
+            "{{\"type\":\"progress\",\"event\":\"phase\",\"phase\":\"{s}\",\"done\":{d},\"total\":{d}}}\n",
+            .{ escaped_phase, done, total },
+        );
+    }
+}
+
+fn escapeJson(buf: []u8, input: []const u8) []const u8 {
+    var out_idx: usize = 0;
+    for (input) |c| {
+        switch (c) {
+            '\\', '"' => {
+                if (out_idx + 2 > buf.len) break;
+                buf[out_idx] = '\\';
+                buf[out_idx + 1] = c;
+                out_idx += 2;
+            },
+            '\n' => {
+                if (out_idx + 2 > buf.len) break;
+                buf[out_idx] = '\\';
+                buf[out_idx + 1] = 'n';
+                out_idx += 2;
+            },
+            '\r' => {
+                if (out_idx + 2 > buf.len) break;
+                buf[out_idx] = '\\';
+                buf[out_idx + 1] = 'r';
+                out_idx += 2;
+            },
+            '\t' => {
+                if (out_idx + 2 > buf.len) break;
+                buf[out_idx] = '\\';
+                buf[out_idx + 1] = 't';
+                out_idx += 2;
+            },
+            else => {
+                if (out_idx + 1 > buf.len) break;
+                buf[out_idx] = c;
+                out_idx += 1;
+            },
+        }
+    }
+    return buf[0..out_idx];
+}
+
 pub const PackageSpec = struct {
     name: []const u8,
     path: []const u8,
@@ -33,48 +89,163 @@ pub const RunConfig = struct {
     tool_version: []const u8 = "unversioned",
     tool_arguments: []const []const u8 = &.{},
     single_document_relative_path: ?[]const u8 = null,
+    requested_document_relative_paths: ?[]const []const u8 = null,
 };
 
-pub fn run(config: RunConfig, allocator: std.mem.Allocator, writer: anytype) !void {
+pub const AnalysisResult = struct {
+    store: DocumentStore,
+    documents: std.ArrayListUnmanaged(scip.Document),
+    external_symbols: std.ArrayListUnmanaged(scip.SymbolInformation),
+    project_root: []const u8,
+    failed_requested_paths: std.ArrayListUnmanaged([]const u8),
+
+    pub fn deinit(result: *AnalysisResult) void {
+        for (result.documents.items) |*doc| {
+            result.store.allocator.free(doc.relative_path);
+        }
+        result.documents.deinit(result.store.allocator);
+        result.external_symbols.deinit(result.store.allocator);
+        result.failed_requested_paths.deinit(result.store.allocator);
+        result.store.allocator.free(result.project_root);
+        result.store.deinit();
+    }
+};
+
+fn markFailedRequestedPath(
+    allocator: std.mem.Allocator,
+    failed_paths: *std.ArrayListUnmanaged([]const u8),
+    requested_path: []const u8,
+) !void {
+    for (failed_paths.items) |existing| {
+        if (std.mem.eql(u8, existing, requested_path)) return;
+    }
+    try failed_paths.append(allocator, requested_path);
+}
+
+fn pathRequested(requested_paths: []const []const u8, path: []const u8) bool {
+    for (requested_paths) |requested_path| {
+        if (std.mem.eql(u8, requested_path, path)) return true;
+    }
+    return false;
+}
+
+pub fn analyze(config: RunConfig, allocator: std.mem.Allocator) !AnalysisResult {
+    const analyze_start_ms = std.time.milliTimestamp();
     var doc_store = DocumentStore{
         .allocator = allocator,
         .root_path = config.root_path,
     };
-    defer doc_store.deinit();
+    errdefer doc_store.deinit();
 
     for (config.packages) |pkg| {
         try doc_store.createPackage(pkg.name, pkg.path);
     }
 
-    var tool_args = std.ArrayListUnmanaged([]const u8){};
-    defer tool_args.deinit(allocator);
-    try tool_args.appendSlice(allocator, config.tool_arguments);
+    var failed_requested_paths = std.ArrayListUnmanaged([]const u8){};
+    errdefer failed_requested_paths.deinit(allocator);
 
-    // Run postResolves on all packages
-    var pkg_it = doc_store.packages.iterator();
-    while (pkg_it.next()) |pkg_entry| {
-        var handle_it = pkg_entry.value_ptr.handles.iterator();
-        while (handle_it.next()) |h| {
-            try h.value_ptr.*.analyzer.postResolves();
+    if (config.requested_document_relative_paths) |requested_paths| {
+        emitPhaseProgress("load_requested", 0, requested_paths.len, config.root_path);
+        for (requested_paths, 0..) |requested_path, idx| {
+            _ = doc_store.getOrLoadFile(config.root_pkg, requested_path) catch |err| {
+                try markFailedRequestedPath(allocator, &failed_requested_paths, requested_path);
+                std.log.warn("failed to load requested path {s}: {s}", .{ requested_path, @errorName(err) });
+                continue;
+            };
+            emitPhaseProgress("load_requested", idx + 1, requested_paths.len, requested_path);
         }
     }
 
-    var documents = try StoreToScip.storeToScip(allocator, &doc_store, config.root_pkg);
-    defer {
+    std.log.info("analyze: requested loading elapsed_ms={d}", .{std.time.milliTimestamp() - analyze_start_ms});
+
+    // Run postResolves on all packages
+    const post_resolve_start_ms = std.time.milliTimestamp();
+    var pkg_it = doc_store.packages.iterator();
+    var total_handles: usize = 0;
+    var pkg_it_count = doc_store.packages.iterator();
+    while (pkg_it_count.next()) |pkg_entry| total_handles += pkg_entry.value_ptr.handles.count();
+    var resolved_handles: usize = 0;
+    while (pkg_it.next()) |pkg_entry| {
+        var handle_it = pkg_entry.value_ptr.handles.iterator();
+        while (handle_it.next()) |h| {
+            emitPhaseProgress("post_resolves", resolved_handles, total_handles, h.key_ptr.*);
+            h.value_ptr.*.analyzer.postResolves() catch |err| {
+                if (config.requested_document_relative_paths) |requested_paths| {
+                    if (pathRequested(requested_paths, h.key_ptr.*)) {
+                        try markFailedRequestedPath(allocator, &failed_requested_paths, h.key_ptr.*);
+                    }
+                }
+                std.log.warn("postResolves failed for {s}: {s}", .{ h.key_ptr.*, @errorName(err) });
+                resolved_handles += 1;
+                continue;
+            };
+            resolved_handles += 1;
+        }
+    }
+    emitPhaseProgress("post_resolves", resolved_handles, total_handles, config.root_path);
+    std.log.info("analyze: postResolves elapsed_ms={d} handles={d}", .{ std.time.milliTimestamp() - post_resolve_start_ms, total_handles });
+
+    var requested_paths = config.requested_document_relative_paths;
+    var single_requested: [1][]const u8 = undefined;
+    if (requested_paths == null) {
+        if (config.single_document_relative_path) |single_path| {
+            single_requested[0] = single_path;
+            requested_paths = single_requested[0..];
+        }
+    }
+
+    var successful_requested_paths = std.ArrayListUnmanaged([]const u8){};
+    defer successful_requested_paths.deinit(allocator);
+    if (requested_paths) |paths| {
+        for (paths) |requested_path| {
+            if (!pathRequested(failed_requested_paths.items, requested_path)) {
+                try successful_requested_paths.append(allocator, requested_path);
+            }
+        }
+        requested_paths = successful_requested_paths.items;
+    }
+
+    const store_to_scip_start_ms = std.time.milliTimestamp();
+    emitPhaseProgress("store_to_scip", 0, 1, config.root_path);
+    var documents = try StoreToScip.storeToScip(allocator, &doc_store, config.root_pkg, requested_paths);
+    errdefer {
         for (documents.items) |*doc| {
             allocator.free(doc.relative_path);
         }
         documents.deinit(allocator);
     }
+    emitPhaseProgress("store_to_scip", 1, 1, config.root_path);
+    std.log.info("analyze: storeToScip elapsed_ms={d} docs={d}", .{ std.time.milliTimestamp() - store_to_scip_start_ms, documents.items.len });
 
-    try filterDocumentsForSinglePath(&documents, config.single_document_relative_path);
+    try validateRequestedDocuments(documents.items, requested_paths);
 
+    const external_symbols_start_ms = std.time.milliTimestamp();
+    emitPhaseProgress("external_symbols", 0, 1, config.root_path);
     var external_symbols = try StoreToScip.collectExternalSymbols(allocator, documents, config.root_pkg, &doc_store);
-    defer external_symbols.deinit(allocator);
+    errdefer external_symbols.deinit(allocator);
+    emitPhaseProgress("external_symbols", 1, 1, config.root_path);
+    std.log.info("analyze: external_symbols elapsed_ms={d} symbols={d}", .{ std.time.milliTimestamp() - external_symbols_start_ms, external_symbols.items.len });
 
     const project_root = try utils.fromPath(allocator, config.root_path);
-    defer allocator.free(project_root);
     std.log.info("Using project root {s}", .{project_root});
+    std.log.info("analyze: total elapsed_ms={d}", .{std.time.milliTimestamp() - analyze_start_ms});
+
+    return .{
+        .store = doc_store,
+        .documents = documents,
+        .external_symbols = external_symbols,
+        .project_root = project_root,
+        .failed_requested_paths = failed_requested_paths,
+    };
+}
+
+pub fn run(config: RunConfig, allocator: std.mem.Allocator, writer: anytype) !void {
+    var result = try analyze(config, allocator);
+    defer result.deinit();
+
+    var tool_args = std.ArrayListUnmanaged([]const u8){};
+    defer tool_args.deinit(allocator);
+    try tool_args.appendSlice(allocator, config.tool_arguments);
 
     try protobruh.encode(scip.Index{
         .metadata = .{
@@ -85,33 +256,22 @@ pub fn run(config: RunConfig, allocator: std.mem.Allocator, writer: anytype) !vo
                 .version = config.tool_version,
                 .arguments = tool_args,
             },
-            .project_root = project_root,
+            .project_root = result.project_root,
             .text_document_encoding = .utf8,
         },
-        .documents = documents,
-        .external_symbols = external_symbols,
+        .documents = result.documents,
+        .external_symbols = result.external_symbols,
     }, writer);
 }
 
-fn filterDocumentsForSinglePath(documents: *std.ArrayListUnmanaged(scip.Document), maybe_target_path: ?[]const u8) !void {
-    const target_path = maybe_target_path orelse return;
+fn validateRequestedDocuments(documents: []const scip.Document, maybe_requested_paths: ?[]const []const u8) !void {
+    const requested_paths = maybe_requested_paths orelse return;
 
-    var target_index: ?usize = null;
-    for (documents.items, 0..) |doc, idx| {
-        if (std.mem.eql(u8, doc.relative_path, target_path)) {
-            target_index = idx;
-            break;
-        }
+    for (requested_paths) |requested_path| {
+        for (documents) |doc| {
+            if (std.mem.eql(u8, doc.relative_path, requested_path)) break;
+        } else return error.TargetDocumentNotFound;
     }
-
-    const idx = target_index orelse return error.TargetDocumentNotFound;
-    if (idx != 0) {
-        const keep = documents.items[idx];
-        const first = documents.items[0];
-        documents.items[0] = keep;
-        documents.items[idx] = first;
-    }
-    documents.items.len = 1;
 }
 
 test {
@@ -411,7 +571,7 @@ test "deterministic SCIP output for indexing fixtures" {
     try std.testing.expect(std.mem.eql(u8, first, second));
 }
 
-test "single-document filter keeps only requested document" {
+test "validateRequestedDocuments accepts requested paths" {
     var docs = std.ArrayListUnmanaged(scip.Document){};
     defer docs.deinit(std.testing.allocator);
 
@@ -428,7 +588,6 @@ test "single-document filter keeps only requested document" {
         .symbols = .{},
     });
 
-    try filterDocumentsForSinglePath(&docs, "src/b.zig");
-    try std.testing.expectEqual(@as(usize, 1), docs.items.len);
-    try std.testing.expectEqualStrings("src/b.zig", docs.items[0].relative_path);
+    try validateRequestedDocuments(docs.items, &.{"src/b.zig"});
+    try std.testing.expectError(error.TargetDocumentNotFound, validateRequestedDocuments(docs.items, &.{"src/missing.zig"}));
 }

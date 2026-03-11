@@ -2,11 +2,26 @@ const std = @import("std");
 const scip = @import("scip.zig");
 const DocumentStore = @import("analysis/DocumentStore.zig");
 
-pub fn storeToScip(allocator: std.mem.Allocator, store: *DocumentStore, pkg: []const u8) !std.ArrayListUnmanaged(scip.Document) {
+pub fn storeToScip(
+    allocator: std.mem.Allocator,
+    store: *DocumentStore,
+    pkg: []const u8,
+    requested_paths: ?[]const []const u8,
+) !std.ArrayListUnmanaged(scip.Document) {
     var documents = std.ArrayListUnmanaged(scip.Document){};
+    var requested = std.StringHashMapUnmanaged(void){};
+    defer requested.deinit(allocator);
+
+    if (requested_paths) |paths| {
+        for (paths) |path| {
+            try requested.put(allocator, path, {});
+        }
+    }
 
     var docit = store.packages.get(pkg).?.handles.iterator();
     while (docit.next()) |entry| {
+        if (requested_paths != null and !requested.contains(entry.key_ptr.*)) continue;
+
         const handle = entry.value_ptr.*;
         const document = try documents.addOne(allocator);
 

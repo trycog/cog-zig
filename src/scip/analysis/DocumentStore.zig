@@ -31,6 +31,8 @@ pub const Handle = struct {
     analyzer: Analyzer,
     /// Pre-scanned @import builtin call nodes for O(1) lookup
     import_nodes: std.ArrayListUnmanaged(std.zig.Ast.Node.Index) = .{},
+    /// Cache import string -> resolved handle (or null when unresolved/loading)
+    import_cache: std.StringHashMapUnmanaged(?*Handle) = .{},
     /// Pre-built line offset table for O(log n) position lookups
     line_index: offsets.LineIndex = .{ .line_offsets = &.{0} },
 
@@ -66,6 +68,11 @@ pub fn deinit(store: *DocumentStore) void {
             const handle = h.value_ptr.*;
             handle.analyzer.deinit();
             handle.import_nodes.deinit(store.allocator);
+            var import_it = handle.import_cache.iterator();
+            while (import_it.next()) |entry| {
+                store.allocator.free(entry.key_ptr.*);
+            }
+            handle.import_cache.deinit(store.allocator);
             store.allocator.free(handle.line_index.line_offsets);
             handle.tree.deinit(store.allocator);
             store.allocator.free(handle.text);
@@ -93,21 +100,30 @@ pub fn createPackage(store: *DocumentStore, package: []const u8, root: []const u
     _ = try store.loadFile(package, root_relative);
 }
 
+fn normalizeRelativePath(store: *DocumentStore, path: []const u8) ![]u8 {
+    const abs = try std.fs.path.resolve(store.allocator, &.{ store.root_path, path });
+    defer store.allocator.free(abs);
+    return try std.fs.path.relative(store.allocator, store.root_path, abs);
+}
+
 pub fn loadFile(store: *DocumentStore, package: []const u8, path: []const u8) !*Handle {
-    std.log.info("Loading {s}", .{path});
+    const normalized_path = try normalizeRelativePath(store, path);
+    defer store.allocator.free(normalized_path);
+
+    std.log.info("Loading {s}", .{normalized_path});
     std.debug.assert(!std.fs.path.isAbsolute(path)); // use relative path
 
     const package_entry = store.packages.getEntry(package).?;
 
     // Import cycle detection
-    if (package_entry.value_ptr.loading.contains(path)) return error.ImportCycle;
-    try package_entry.value_ptr.loading.put(store.allocator, path, {});
-    defer _ = package_entry.value_ptr.loading.remove(path);
+    if (package_entry.value_ptr.loading.contains(normalized_path)) return error.ImportCycle;
+    try package_entry.value_ptr.loading.put(store.allocator, normalized_path, {});
+    defer _ = package_entry.value_ptr.loading.remove(normalized_path);
 
-    const path_duped = try store.allocator.dupe(u8, path);
+    const path_duped = try store.allocator.dupe(u8, normalized_path);
     errdefer store.allocator.free(path_duped);
 
-    const concat_path = try std.fs.path.join(store.allocator, &.{ store.root_path, path });
+    const concat_path = try std.fs.path.join(store.allocator, &.{ store.root_path, normalized_path });
     defer store.allocator.free(concat_path);
 
     var file = try std.fs.openFileAbsolute(concat_path, .{});
@@ -162,29 +178,43 @@ pub fn loadFile(store: *DocumentStore, package: []const u8, path: []const u8) !*
         .line_index = line_index,
     };
 
-    // Initialize analyzer before inserting into the map. The loading map
-    // handles cycle detection. If init fails, errdefers clean up correctly
-    // since the handle isn't in the map yet (no dangling pointer).
-    try handle.analyzer.init();
-
     try store.packages.getEntry(package).?.value_ptr.handles.put(store.allocator, path_duped, handle);
+    errdefer _ = store.packages.getEntry(package).?.value_ptr.handles.remove(path_duped);
+
+    // Insert the handle before init so recursive imports can reuse the
+    // in-progress handle instead of reloading the same file repeatedly.
+    try handle.analyzer.init();
 
     return handle;
 }
 
 pub fn getOrLoadFile(store: *DocumentStore, package: []const u8, path: []const u8) anyerror!*Handle {
-    return store.packages.get(package).?.handles.get(path) orelse store.loadFile(package, path);
+    const normalized_path = try normalizeRelativePath(store, path);
+    defer store.allocator.free(normalized_path);
+    return store.packages.get(package).?.handles.get(normalized_path) orelse store.loadFile(package, normalized_path);
 }
 
 pub fn resolveImportHandle(store: *DocumentStore, handle: *Handle, import: []const u8) anyerror!?*Handle {
-    if (std.mem.endsWith(u8, import, ".zig")) {
-        const root_dir = std.fs.path.dirname(store.packages.get(handle.package).?.root) orelse return error.InvalidPackageRoot;
-        var rel = try std.fs.path.resolve(store.allocator, &[_][]const u8{ root_dir, handle.path, "..", import });
+    if (handle.import_cache.get(import)) |cached| return cached;
+
+    const resolved = if (std.mem.endsWith(u8, import, ".zig")) blk: {
+        const rel = try std.fs.path.resolve(store.allocator, &[_][]const u8{ store.root_path, handle.path, "..", import });
         defer store.allocator.free(rel);
 
-        return try store.getOrLoadFile(handle.package, rel[root_dir.len + 1 ..]);
-    } else {
+        const relative = try std.fs.path.relative(store.allocator, store.root_path, rel);
+        defer store.allocator.free(relative);
+        const pkg = store.packages.get(handle.package).?;
+        if (pkg.loading.contains(relative)) {
+            logger.warn("Import currently loading for {s} from {s}", .{ relative, handle.path });
+            break :blk null;
+        }
+
+        break :blk try store.getOrLoadFile(handle.package, relative);
+    } else blk: {
         const pkg = store.packages.get(import) orelse return null;
-        return pkg.handles.get(pkg.root_relative);
-    }
+        break :blk pkg.handles.get(pkg.root_relative);
+    };
+
+    try handle.import_cache.put(store.allocator, try store.allocator.dupe(u8, import), resolved);
+    return resolved;
 }
