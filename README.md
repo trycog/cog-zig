@@ -116,8 +116,8 @@ Version and build-mode expectations are tracked in `src/debug/tests/zig_version_
 ## How It Works
 
 Cog invokes `cog-zig` once per extension group. It expands matched files onto
-argv, the wrapper indexes them in bulk, and it emits per-file progress events
-on stderr as each file finishes:
+argv, the wrapper distributes that batch across internal worker threads, and it
+emits per-file progress events on stderr as each file finishes:
 
 ```
 cog invokes:      bin/cog-zig --output <output_path> <file_path> [file_path ...]

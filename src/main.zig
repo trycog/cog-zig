@@ -60,44 +60,15 @@ pub fn main() !void {
     debugLog("index:start files={d}", .{file_paths.items.len});
     logResourceUsage("index:start");
 
-    var collected_documents = std.ArrayListUnmanaged(scip_types.Document){};
-    defer collected_documents.deinit(allocator);
-    var collected_external_symbols = std.ArrayListUnmanaged(scip_types.SymbolInformation){};
-    defer collected_external_symbols.deinit(allocator);
-
-    var metadata_root: ?[]const u8 = null;
-
-    for (file_paths.items) |input_path| {
-        const file_start_ms = std.time.milliTimestamp();
-        debugLog("file:start path={s}", .{input_path});
-        logResourceUsage("file:start");
-        const single_result = indexSingleFile(allocator, input_path, args) catch |err| {
-            emitProgress("file_error", input_path);
-            debugLog("file:error path={s} err={s} elapsed_ms={d}", .{ input_path, @errorName(err), std.time.milliTimestamp() - file_start_ms });
-            logResourceUsage("file:error");
-            if (std.posix.getenv("COG_ZIG_DEBUG") != null) {
-                std.debug.print("debug: failed to index {s}: {s}\n", .{ input_path, @errorName(err) });
-            }
-            continue;
-        };
-
-        if (metadata_root == null) {
-            metadata_root = try allocator.dupe(u8, single_result.index.metadata.project_root);
+    const batch = try indexBatchFiles(allocator, file_paths.items, args);
+    defer {
+        for (batch.tasks) |*task| {
+            _ = task.gpa_state.deinit();
         }
-
-        for (single_result.index.documents.items) |doc| {
-            try collected_documents.append(allocator, doc);
-        }
-        for (single_result.index.external_symbols.items) |sym| {
-            try collected_external_symbols.append(allocator, sym);
-        }
-
-        emitProgress("file_done", single_result.relative_path);
-        debugLog("file:done path={s} elapsed_ms={d} docs={d} external_symbols={d}", .{ single_result.relative_path, std.time.milliTimestamp() - file_start_ms, single_result.index.documents.items.len, single_result.index.external_symbols.items.len });
-        logResourceUsage("file:done");
+        allocator.free(batch.tasks);
     }
 
-    const project_root = metadata_root orelse blk: {
+    const project_root = batch.metadata_root orelse blk: {
         const cwd = try fs.cwd().realpathAlloc(allocator, ".");
         defer allocator.free(cwd);
         break :blk try std.fmt.allocPrint(allocator, "file://{s}", .{cwd});
@@ -121,13 +92,131 @@ pub fn main() !void {
             .project_root = project_root,
             .text_document_encoding = .utf8,
         },
-        .documents = collected_documents,
-        .external_symbols = collected_external_symbols,
+        .documents = batch.documents,
+        .external_symbols = batch.external_symbols,
     }, &file_writer.interface);
 
     try file_writer.interface.flush();
     debugLog("index:done files={d} elapsed_ms={d}", .{ file_paths.items.len, std.time.milliTimestamp() - index_start_ms });
     logResourceUsage("index:done");
+}
+
+const BatchIndexResult = struct {
+    documents: std.ArrayListUnmanaged(scip_types.Document),
+    external_symbols: std.ArrayListUnmanaged(scip_types.SymbolInformation),
+    metadata_root: ?[]const u8,
+    tasks: []BatchTaskState,
+};
+
+const BatchTaskState = struct {
+    collector: *BatchCollector,
+    input_path: []const u8,
+    full_args: []const []const u8,
+    gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .{},
+};
+
+const BatchCollector = struct {
+    allocator: mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    documents: std.ArrayListUnmanaged(scip_types.Document) = .{},
+    external_symbols: std.ArrayListUnmanaged(scip_types.SymbolInformation) = .{},
+    metadata_root: ?[]const u8 = null,
+
+    fn recordSuccess(collector: *BatchCollector, single_result: SingleIndexResult, started_at_ms: i64) void {
+        collector.mutex.lock();
+        defer collector.mutex.unlock();
+
+        if (collector.metadata_root == null) {
+            collector.metadata_root = collector.allocator.dupe(u8, single_result.index.metadata.project_root) catch single_result.index.metadata.project_root;
+        }
+
+        collector.documents.appendSlice(collector.allocator, single_result.index.documents.items) catch {
+            emitProgress("file_error", single_result.relative_path);
+            return;
+        };
+        collector.external_symbols.appendSlice(collector.allocator, single_result.index.external_symbols.items) catch {
+            emitProgress("file_error", single_result.relative_path);
+            return;
+        };
+
+        collector.allocator.free(single_result.index.documents.items);
+        collector.allocator.free(single_result.index.external_symbols.items);
+
+        emitProgress("file_done", single_result.relative_path);
+        debugLog("file:done path={s} elapsed_ms={d} docs={d} external_symbols={d}", .{ single_result.relative_path, std.time.milliTimestamp() - started_at_ms, single_result.index.documents.items.len, single_result.index.external_symbols.items.len });
+        logResourceUsage("file:done");
+    }
+
+    fn recordFailure(collector: *BatchCollector, input_path: []const u8, err: anyerror, started_at_ms: i64) void {
+        collector.mutex.lock();
+        defer collector.mutex.unlock();
+
+        emitProgress("file_error", input_path);
+        debugLog("file:error path={s} err={s} elapsed_ms={d}", .{ input_path, @errorName(err), std.time.milliTimestamp() - started_at_ms });
+        logResourceUsage("file:error");
+        if (std.posix.getenv("COG_ZIG_DEBUG") != null) {
+            std.debug.print("debug: failed to index {s}: {s}\n", .{ input_path, @errorName(err) });
+        }
+    }
+};
+
+fn indexBatchFiles(allocator: mem.Allocator, file_paths: []const []const u8, full_args: []const []const u8) !BatchIndexResult {
+    var collector = BatchCollector{ .allocator = allocator };
+    var pool: std.Thread.Pool = undefined;
+    try pool.init(.{ .allocator = allocator });
+    defer pool.deinit();
+
+    var wait_group: std.Thread.WaitGroup = .{};
+
+    const tasks = try allocator.alloc(BatchTaskState, file_paths.len);
+    errdefer allocator.free(tasks);
+
+    for (file_paths, 0..) |input_path, idx| {
+        tasks[idx] = .{
+            .collector = &collector,
+            .input_path = input_path,
+            .full_args = full_args,
+        };
+        pool.spawnWg(&wait_group, indexBatchWorker, .{&tasks[idx]});
+    }
+
+    wait_group.wait();
+
+    std.mem.sortUnstable(scip_types.Document, collector.documents.items, {}, struct {
+        fn lessThan(_: void, lhs: scip_types.Document, rhs: scip_types.Document) bool {
+            return std.mem.lessThan(u8, lhs.relative_path, rhs.relative_path);
+        }
+    }.lessThan);
+    std.mem.sortUnstable(scip_types.SymbolInformation, collector.external_symbols.items, {}, struct {
+        fn lessThan(_: void, lhs: scip_types.SymbolInformation, rhs: scip_types.SymbolInformation) bool {
+            return std.mem.lessThan(u8, lhs.symbol, rhs.symbol);
+        }
+    }.lessThan);
+
+    debugLog("indexBatchFiles: completed files={d} docs={d} external_symbols={d}", .{ file_paths.len, collector.documents.items.len, collector.external_symbols.items.len });
+    logResourceUsage("indexBatchFiles:done");
+
+    return .{
+        .documents = collector.documents,
+        .external_symbols = collector.external_symbols,
+        .metadata_root = collector.metadata_root,
+        .tasks = tasks,
+    };
+}
+
+fn indexBatchWorker(task: *BatchTaskState) void {
+    const collector = task.collector;
+    const worker_allocator = task.gpa_state.allocator();
+    const started_at_ms = std.time.milliTimestamp();
+    debugLog("file:start path={s}", .{task.input_path});
+    logResourceUsage("file:start");
+
+    const single_result = indexSingleFile(worker_allocator, task.input_path, task.full_args) catch |err| {
+        collector.recordFailure(task.input_path, err, started_at_ms);
+        return;
+    };
+
+    collector.recordSuccess(single_result, started_at_ms);
 }
 
 const SingleIndexResult = struct {
@@ -458,4 +547,44 @@ test "pathKind distinguishes file and directory" {
     try std.testing.expectEqual(PathKind.directory, pathKind(abs_dir));
     try std.testing.expectEqual(PathKind.file, pathKind(abs_file));
     try std.testing.expectEqual(PathKind.missing, pathKind("/this/path/should/not/exist-12345"));
+}
+
+test "indexBatchFiles indexes multiple requested files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("workspace/src");
+    try tmp.dir.writeFile(.{ .sub_path = "workspace/build.zig.zon", .data = 
+        \\ .{
+        \\   .name = .workspace,
+        \\   .version = "0.0.0",
+        \\   .fingerprint = 0x2222222222222222,
+        \\   .paths = .{ "src" },
+        \\ }
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "workspace/src/helper.zig", .data = 
+        \\ pub fn greet() void {}
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "workspace/src/main.zig", .data = 
+        \\ const helper = @import("helper.zig");
+        \\ pub fn main() void {
+        \\     helper.greet();
+        \\ }
+    });
+
+    const base_allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(base_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const abs_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const abs_main = try fs.path.join(allocator, &.{ abs_root, "workspace", "src", "main.zig" });
+    const abs_helper = try fs.path.join(allocator, &.{ abs_root, "workspace", "src", "helper.zig" });
+
+    const result = try indexBatchFiles(allocator, &.{ abs_main, abs_helper }, &.{ "cog-zig", "--output", "index.scip", abs_main, abs_helper });
+
+    try std.testing.expectEqual(@as(usize, 2), result.documents.items.len);
+    try std.testing.expectEqualStrings("src/helper.zig", result.documents.items[0].relative_path);
+    try std.testing.expectEqualStrings("src/main.zig", result.documents.items[1].relative_path);
+    try std.testing.expect(result.metadata_root != null);
 }
