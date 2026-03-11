@@ -12,7 +12,14 @@ fn logFn(
     args: anytype,
 ) void {
     if (std.posix.getenv("COG_ZIG_DEBUG") == null) return;
-    std.log.defaultLog(level, scope, format, args);
+    var msg_buf: [2048]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, format, args) catch return;
+    var escaped_msg_buf: [4096]u8 = undefined;
+    const escaped_msg = escapeJson(&escaped_msg_buf, msg);
+    std.debug.print(
+        "{{\"type\":\"debug\",\"level\":\"{s}\",\"scope\":\"{s}\",\"message\":\"{s}\"}}\n",
+        .{ @tagName(level), @tagName(scope), escaped_msg },
+    );
 }
 
 pub const std_options = std.Options{

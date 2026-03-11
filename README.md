@@ -186,9 +186,11 @@ Enable verbose indexing diagnostics with:
 COG_ZIG_DEBUG=1 bin/cog-zig --output /tmp/index.scip /path/to/file.zig 2> /tmp/cog-zig-debug.log
 ```
 
-With `COG_ZIG_DEBUG=1`, the wrapper emits per-file timing, SCIP run/decode phase
-timings, and process resource-usage snapshots to help diagnose hangs or heavy
-files.
+With `COG_ZIG_DEBUG=1`, the wrapper emits structured debug events on stderr for
+per-file timing, SCIP phase timing, and process resource-usage snapshots. When
+run through `cog code:index` with Cog debug logging enabled, those non-progress
+stderr lines are forwarded into `.cog/cog.log` while progress JSON continues to
+drive the live TUI.
 
 ---
 
