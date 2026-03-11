@@ -1201,18 +1201,7 @@ pub fn scopeIntermediate(
 
             try analyzer.addDeclaration(scope_idx, decl, null);
 
-            const func_scope_name = if (node_idx == .root)
-                try analyzer.trackSymbol(try std.fmt.allocPrint(analyzer.allocator, "file . {s} unversioned {f}", .{ analyzer.handle.package, analyzer.handle.formatter() }))
-            else
-                (if (analyzer.getDescriptor(scope_idx)) |desc|
-                    try analyzer.trackSymbol(try std.mem.concat(analyzer.allocator, u8, &.{ desc, analyzer.formatSubSymbol(scope_name orelse {
-                        logger.warn("Missing function scope name at node {d}", .{@intFromEnum(node_idx)});
-                        return;
-                    }), "()." }))
-                else blk: {
-                    analyzer.local_counter += 1;
-                    break :blk try analyzer.trackSymbol(try std.fmt.allocPrint(analyzer.allocator, "local {d}", .{analyzer.local_counter}));
-                });
+            const func_scope_name = decl.symbol;
 
             const scope = try analyzer.scopes.addOne(analyzer.allocator);
             scope.* = .{
