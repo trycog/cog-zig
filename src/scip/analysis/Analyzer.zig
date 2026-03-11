@@ -27,6 +27,7 @@ file_relationships: std.ArrayListUnmanaged(scip.Relationship) = .{},
 local_counter: usize = 0,
 
 post_resolves: std.ArrayListUnmanaged(PostResolve) = .{},
+resolving_identifiers: std.AutoHashMapUnmanaged(ResolveIdentifierKey, void) = .{},
 
 /// Maps node indices to scope indices for O(1) lookup
 scope_map: std.AutoHashMapUnmanaged(Ast.Node.Index, usize) = .{},
@@ -35,6 +36,12 @@ scope_map: std.AutoHashMapUnmanaged(Ast.Node.Index, usize) = .{},
 allocated_symbols: std.ArrayListUnmanaged([]const u8) = .{},
 
 const PostResolve = struct { scope_idx: usize, node_idx: Ast.Node.Index };
+
+const ResolveIdentifierKey = struct {
+    foreign_analyzer: *Analyzer,
+    scope_idx: usize,
+    token_idx: Ast.TokenIndex,
+};
 
 pub fn init(analyzer: *Analyzer) !void {
     logger.info("Initializing file {s}", .{analyzer.handle.path});
@@ -65,6 +72,7 @@ pub fn deinit(analyzer: *Analyzer) void {
     }
     analyzer.occurrences.deinit(analyzer.allocator);
     analyzer.post_resolves.deinit(analyzer.allocator);
+    analyzer.resolving_identifiers.deinit(analyzer.allocator);
     analyzer.scope_map.deinit(analyzer.allocator);
 }
 
@@ -180,6 +188,17 @@ pub fn resolveAndMarkDeclarationIdentifier(
     scope_idx: usize,
     token_idx: Ast.TokenIndex,
 ) anyerror!DeclarationWithAnalyzer {
+    const resolve_key: ResolveIdentifierKey = .{
+        .foreign_analyzer = foreign_analyzer,
+        .scope_idx = scope_idx,
+        .token_idx = token_idx,
+    };
+    const gop = try analyzer.resolving_identifiers.getOrPut(analyzer.allocator, resolve_key);
+    if (gop.found_existing) {
+        return DeclarationWithAnalyzer{ .analyzer = foreign_analyzer, .scope_idx = scope_idx };
+    }
+    defer _ = analyzer.resolving_identifiers.remove(resolve_key);
+
     const tree = analyzer.handle.tree;
     // const scope = analyzer.scopes.items[scope_idx];
 

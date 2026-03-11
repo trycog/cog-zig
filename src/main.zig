@@ -63,7 +63,9 @@ pub fn main() !void {
     var batch = try indexBatchFiles(allocator, file_paths.items, args);
     defer batch.deinit(allocator);
 
-    const project_root = batch.metadata_root orelse blk: {
+    const project_root = if (batch.metadata_root) |metadata_root|
+        try allocator.dupe(u8, metadata_root)
+    else blk: {
         const cwd = try fs.cwd().realpathAlloc(allocator, ".");
         defer allocator.free(cwd);
         break :blk try std.fmt.allocPrint(allocator, "file://{s}", .{cwd});
