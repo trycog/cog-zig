@@ -3,6 +3,7 @@ ache/
 zig-out/
 bin/
 .claude/
+.opencode/
 .mcp.json
 .zig-cache/
 opencode.*
