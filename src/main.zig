@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const fs = std.fs;
 const mem = std.mem;
 const process = std.process;
@@ -90,7 +91,7 @@ pub fn main() !void {
             .version = .unspecified_protocol_version,
             .tool_info = .{
                 .name = "cog-zig",
-                .version = "unversioned",
+                .version = build_options.version,
                 .arguments = .{},
             },
             .project_root = project_root,

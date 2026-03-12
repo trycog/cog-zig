@@ -1,5 +1,6 @@
 {
   "name": "cog-zig",
+  "version": "0.1.0",
   "extensions": [".zig", ".zon"],
   "args": ["--output", "{output}", "{files}"],
   "build": "zig build -Doptimize=ReleaseFast && mkdir -p bin && rm -f bin/cog-zig && cp zig-out/bin/cog-zig bin/cog-zig",
